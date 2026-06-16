@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "vulkan_texture.h"
 #include "vulkan_builders.h"
@@ -8,9 +8,10 @@
 #include "common/align.h"
 #include "common/assert.h"
 #include "common/bitutils.h"
+#include "common/error.h"
 #include "common/log.h"
 
-Log_SetChannel(VulkanDevice);
+LOG_CHANNEL(GPUDevice);
 
 static constexpr const VkComponentMapping s_identity_swizzle{
   VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -18,6 +19,7 @@ static constexpr const VkComponentMapping s_identity_swizzle{
 
 static VkImageLayout GetVkImageLayout(VulkanTexture::Layout layout)
 {
+  // TODO: Wrong for depth textures in feedback loop
   static constexpr std::array<VkImageLayout, static_cast<u32>(VulkanTexture::Layout::Count)> s_vk_layout_mapping = {{
     VK_IMAGE_LAYOUT_UNDEFINED,                        // Undefined
     VK_IMAGE_LAYOUT_PREINITIALIZED,                   // Preinitialized
@@ -34,21 +36,17 @@ static VkImageLayout GetVkImageLayout(VulkanTexture::Layout layout)
     VK_IMAGE_LAYOUT_GENERAL,                          // ComputeReadWriteImage
     VK_IMAGE_LAYOUT_GENERAL,                          // General
   }};
-  return (layout == VulkanTexture::Layout::FeedbackLoop && VulkanDevice::GetInstance().UseFeedbackLoopLayout()) ?
-           VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT :
+  return (layout == VulkanTexture::Layout::FeedbackLoop &&
+          VulkanDevice::GetInstance().GetOptionalExtensions().vk_khr_dynamic_rendering_local_read) ?
+           VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR :
            s_vk_layout_mapping[static_cast<u32>(layout)];
 }
 
-static VkAccessFlagBits GetFeedbackLoopInputAccessBits()
-{
-  return VulkanDevice::GetInstance().UseFeedbackLoopLayout() ? VK_ACCESS_SHADER_READ_BIT :
-                                                               VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
-}
-
-VulkanTexture::VulkanTexture(u32 width, u32 height, u32 layers, u32 levels, u32 samples, Type type, Format format,
-                             VkImage image, VmaAllocation allocation, VkImageView view, VkFormat vk_format)
+VulkanTexture::VulkanTexture(u32 width, u32 height, u32 layers, u32 levels, u32 samples, Type type,
+                             GPUTextureFormat format, Flags flags, VkImage image, VmaAllocation allocation,
+                             VkImageView view, VkFormat vk_format)
   : GPUTexture(static_cast<u16>(width), static_cast<u16>(height), static_cast<u8>(layers), static_cast<u8>(levels),
-               static_cast<u8>(samples), type, format),
+               static_cast<u8>(samples), type, format, flags),
     m_image(image), m_allocation(allocation), m_view(view), m_vk_format(vk_format)
 {
 }
@@ -59,9 +57,10 @@ VulkanTexture::~VulkanTexture()
 }
 
 std::unique_ptr<VulkanTexture> VulkanTexture::Create(u32 width, u32 height, u32 layers, u32 levels, u32 samples,
-                                                     Type type, Format format, VkFormat vk_format)
+                                                     Type type, GPUTextureFormat format, Flags flags,
+                                                     VkFormat vk_format, Error* error)
 {
-  if (!ValidateConfig(width, height, layers, levels, samples, type, format))
+  if (!ValidateConfig(width, height, layers, levels, samples, type, format, flags, error))
     return {};
 
   VulkanDevice& dev = VulkanDevice::GetInstance();
@@ -96,7 +95,6 @@ std::unique_ptr<VulkanTexture> VulkanTexture::Create(u32 width, u32 height, u32 
                                s_identity_swizzle,
                                {VK_IMAGE_ASPECT_COLOR_BIT, 0, static_cast<u32>(levels), 0, 1}};
 
-  // TODO: Don't need the feedback loop stuff yet.
   switch (type)
   {
     case Type::Texture:
@@ -107,11 +105,9 @@ std::unique_ptr<VulkanTexture> VulkanTexture::Create(u32 width, u32 height, u32 
 
     case Type::RenderTarget:
     {
-      DebugAssert(levels == 1);
       ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                   VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                  (dev.UseFeedbackLoopLayout() ? VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT :
-                                                 VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT);
+                  VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
     }
     break;
 
@@ -119,22 +115,18 @@ std::unique_ptr<VulkanTexture> VulkanTexture::Create(u32 width, u32 height, u32 
     {
       DebugAssert(levels == 1);
       ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                  (dev.UseFeedbackLoopLayout() ? VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT : 0);
+                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
       vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
     }
     break;
 
-    case Type::RWTexture:
-    {
-      DebugAssert(levels == 1);
-      ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                  VK_IMAGE_USAGE_SAMPLED_BIT;
-    }
-    break;
+      DefaultCaseIsUnreachable();
+  }
 
-    default:
-      return {};
+  if ((flags & Flags::AllowBindAsImage) != Flags::None)
+  {
+    DebugAssert(levels == 1);
+    ici.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
   }
 
   // Use dedicated allocations for typical RT size
@@ -150,14 +142,9 @@ std::unique_ptr<VulkanTexture> VulkanTexture::Create(u32 width, u32 height, u32 
     aci.flags &= ~VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
     res = vmaCreateImage(dev.GetAllocator(), &ici, &aci, &image, &allocation, nullptr);
   }
-  if (res == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+  if (res != VK_SUCCESS)
   {
-    Log_ErrorPrintf("Failed to allocate device memory for %ux%u texture", width, height);
-    return {};
-  }
-  else if (res != VK_SUCCESS)
-  {
-    LOG_VULKAN_ERROR(res, "vmaCreateImage failed: ");
+    Vulkan::SetErrorObject(error, "vmaCreateImage failed: ", res);
     return {};
   }
 
@@ -166,13 +153,13 @@ std::unique_ptr<VulkanTexture> VulkanTexture::Create(u32 width, u32 height, u32 
   res = vkCreateImageView(dev.GetVulkanDevice(), &vci, nullptr, &view);
   if (res != VK_SUCCESS)
   {
-    LOG_VULKAN_ERROR(res, "vkCreateImageView failed: ");
+    Vulkan::SetErrorObject(error, "vkCreateImageView failed: ", res);
     vmaDestroyImage(dev.GetAllocator(), image, allocation);
     return {};
   }
 
   return std::unique_ptr<VulkanTexture>(
-    new VulkanTexture(width, height, layers, levels, samples, type, format, image, allocation, view, vk_format));
+    new VulkanTexture(width, height, layers, levels, samples, type, format, flags, image, allocation, view, vk_format));
 }
 
 void VulkanTexture::Destroy(bool defer)
@@ -217,33 +204,39 @@ VkImageLayout VulkanTexture::GetVkLayout() const
   return GetVkImageLayout(m_layout);
 }
 
+VkClearColorValue VulkanTexture::GetClearColorValue() const
+{
+  VkClearColorValue ccv;
+  std::memcpy(ccv.float32, GetUNormClearColor().data(), sizeof(ccv.float32));
+  return ccv;
+}
+
+VkClearDepthStencilValue VulkanTexture::GetClearDepthValue() const
+{
+  return VkClearDepthStencilValue{m_clear_value.depth, 0u};
+}
+
 VkCommandBuffer VulkanTexture::GetCommandBufferForUpdate()
 {
   VulkanDevice& dev = VulkanDevice::GetInstance();
   if (m_type != Type::Texture || m_use_fence_counter == dev.GetCurrentFenceCounter())
   {
-    // Console.WriteLn("Texture update within frame, can't use do beforehand");
-    dev.EndRenderPass();
+    // DEV_LOG("Texture update within frame, can't use do beforehand");
+    if (dev.InRenderPass())
+      dev.EndRenderPass();
     return dev.GetCurrentCommandBuffer();
   }
 
   return dev.GetCurrentInitCommandBuffer();
 }
 
-void VulkanTexture::CopyTextureDataForUpload(void* dst, const void* src, u32 width, u32 height, u32 pitch,
-                                             u32 upload_pitch) const
-{
-  StringUtil::StrideMemCpy(dst, upload_pitch, src, pitch, GetPixelSize() * width, height);
-}
-
 VkBuffer VulkanTexture::AllocateUploadStagingBuffer(const void* data, u32 pitch, u32 upload_pitch, u32 width,
-                                                    u32 height) const
+                                                    u32 height, u32 buffer_size) const
 {
-  const u32 size = upload_pitch * height;
   const VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                                   nullptr,
                                   0,
-                                  static_cast<VkDeviceSize>(size),
+                                  static_cast<VkDeviceSize>(buffer_size),
                                   VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                                   VK_SHARING_MODE_EXCLUSIVE,
                                   0,
@@ -270,8 +263,8 @@ VkBuffer VulkanTexture::AllocateUploadStagingBuffer(const void* data, u32 pitch,
   VulkanDevice::GetInstance().DeferBufferDestruction(buffer, allocation);
 
   // And write the data.
-  CopyTextureDataForUpload(ai.pMappedData, data, width, height, pitch, upload_pitch);
-  vmaFlushAllocation(VulkanDevice::GetInstance().GetAllocator(), allocation, 0, size);
+  CopyTextureDataForUpload(width, height, m_format, ai.pMappedData, upload_pitch, data, pitch);
+  vmaFlushAllocation(VulkanDevice::GetInstance().GetAllocator(), allocation, 0, buffer_size);
   return buffer;
 }
 
@@ -282,7 +275,7 @@ void VulkanTexture::UpdateFromBuffer(VkCommandBuffer cmdbuf, u32 x, u32 y, u32 w
   if (old_layout != Layout::TransferDst)
     TransitionSubresourcesToLayout(cmdbuf, layer, 1, level, 1, old_layout, Layout::TransferDst);
 
-  const u32 row_length = pitch / GetPixelSize();
+  const u32 row_length = CalcUploadRowLengthFromPitch(pitch);
 
   const VkBufferImageCopy bic = {static_cast<VkDeviceSize>(buffer_offset),
                                  row_length,
@@ -302,8 +295,9 @@ bool VulkanTexture::Update(u32 x, u32 y, u32 width, u32 height, const void* data
   DebugAssert(layer < m_layers && level < m_levels);
   DebugAssert((x + width) <= GetMipWidth(level) && (y + height) <= GetMipHeight(level));
 
-  const u32 upload_pitch = Common::AlignUpPow2(pitch, VulkanDevice::GetInstance().GetBufferCopyRowPitchAlignment());
-  const u32 required_size = height * upload_pitch;
+  const u32 upload_pitch =
+    Common::AlignUpPow2(CalcUploadPitch(width), VulkanDevice::GetInstance().GetBufferCopyRowPitchAlignment());
+  const u32 required_size = CalcUploadSize(height, upload_pitch);
   VulkanDevice& dev = VulkanDevice::GetInstance();
   VulkanStreamBuffer& sbuffer = dev.GetTextureUploadBuffer();
 
@@ -314,27 +308,30 @@ bool VulkanTexture::Update(u32 x, u32 y, u32 width, u32 height, const void* data
   if (required_size > (sbuffer.GetCurrentSize() / 2))
   {
     buffer_offset = 0;
-    buffer = AllocateUploadStagingBuffer(data, pitch, upload_pitch, width, height);
+    buffer = AllocateUploadStagingBuffer(data, pitch, upload_pitch, width, height, required_size);
     if (buffer == VK_NULL_HANDLE)
       return false;
   }
   else
   {
-    if (!sbuffer.ReserveMemory(required_size, dev.GetBufferCopyOffsetAlignment()))
+    if (!sbuffer.ReserveMemory(required_size, dev.GetBufferCopyOffsetAlignment())) [[unlikely]]
     {
-      dev.SubmitCommandBuffer(false, "While waiting for %u bytes in texture upload buffer", required_size);
-      if (!sbuffer.ReserveMemory(required_size, dev.GetBufferCopyOffsetAlignment()))
+      dev.SubmitCommandBuffer(false, TinyString::from_format("Needs {} bytes in texture upload buffer", required_size));
+      if (!sbuffer.ReserveMemory(required_size, dev.GetBufferCopyOffsetAlignment())) [[unlikely]]
       {
-        Log_ErrorPrintf("Failed to reserve texture upload memory (%u bytes).", required_size);
+        ERROR_LOG("Failed to reserve texture upload memory ({} bytes).", required_size);
         return false;
       }
     }
 
     buffer = sbuffer.GetBuffer();
     buffer_offset = sbuffer.GetCurrentOffset();
-    CopyTextureDataForUpload(sbuffer.GetCurrentHostPointer(), data, width, height, pitch, upload_pitch);
+    CopyTextureDataForUpload(width, height, m_format, sbuffer.GetCurrentHostPointer(), upload_pitch, data, pitch);
     sbuffer.CommitMemory(required_size);
   }
+
+  GPUDevice::GetStatistics().buffer_streamed += required_size;
+  GPUDevice::GetStatistics().num_uploads++;
 
   const VkCommandBuffer cmdbuf = GetCommandBufferForUpdate();
 
@@ -369,16 +366,16 @@ bool VulkanTexture::Map(void** map, u32* map_stride, u32 x, u32 y, u32 width, u3
     CommitClear(GetCommandBufferForUpdate());
 
   // see note in Update() for the reason why.
-  const u32 aligned_pitch = Common::AlignUpPow2(width * GetPixelSize(), dev.GetBufferCopyRowPitchAlignment());
-  const u32 req_size = height * aligned_pitch;
+  const u32 aligned_pitch = Common::AlignUpPow2(CalcUploadPitch(width), dev.GetBufferCopyRowPitchAlignment());
+  const u32 req_size = CalcUploadSize(height, aligned_pitch);
   VulkanStreamBuffer& buffer = dev.GetTextureUploadBuffer();
   if (req_size >= (buffer.GetCurrentSize() / 2))
     return false;
 
-  if (!buffer.ReserveMemory(req_size, dev.GetBufferCopyOffsetAlignment()))
+  if (!buffer.ReserveMemory(req_size, dev.GetBufferCopyOffsetAlignment())) [[unlikely]]
   {
-    dev.SubmitCommandBuffer(false, "While waiting for %u bytes in texture upload buffer", req_size);
-    if (!buffer.ReserveMemory(req_size, dev.GetBufferCopyOffsetAlignment()))
+    dev.SubmitCommandBuffer(false, TinyString::from_format("Needs {} bytes in texture upload buffer", req_size));
+    if (!buffer.ReserveMemory(req_size, dev.GetBufferCopyOffsetAlignment())) [[unlikely]]
       Panic("Failed to reserve texture upload memory");
   }
 
@@ -399,10 +396,13 @@ void VulkanTexture::Unmap()
 {
   VulkanDevice& dev = VulkanDevice::GetInstance();
   VulkanStreamBuffer& sb = dev.GetTextureUploadBuffer();
-  const u32 aligned_pitch = Common::AlignUpPow2(m_map_width * GetPixelSize(), dev.GetBufferCopyRowPitchAlignment());
-  const u32 req_size = m_map_height * aligned_pitch;
+  const u32 aligned_pitch = Common::AlignUpPow2(CalcUploadPitch(m_width), dev.GetBufferCopyRowPitchAlignment());
+  const u32 req_size = CalcUploadSize(m_map_height, aligned_pitch);
   const u32 offset = sb.GetCurrentOffset();
   sb.CommitMemory(req_size);
+
+  GPUDevice::GetStatistics().buffer_streamed += req_size;
+  GPUDevice::GetStatistics().num_uploads++;
 
   // first time the texture is used? don't leave it undefined
   const VkCommandBuffer cmdbuf = GetCommandBufferForUpdate();
@@ -426,15 +426,12 @@ void VulkanTexture::CommitClear()
   if (m_state != GPUTexture::State::Cleared)
     return;
 
-  VulkanDevice& dev = VulkanDevice::GetInstance();
-  if (dev.InRenderPass())
-    dev.EndRenderPass();
-
-  CommitClear(dev.GetCurrentCommandBuffer());
+  CommitClear(GetCommandBufferForUpdate());
 }
 
 void VulkanTexture::CommitClear(VkCommandBuffer cmdbuf)
 {
+  DebugAssert(m_state == State::Cleared);
   TransitionToLayout(cmdbuf, Layout::ClearDst);
 
   if (IsDepthStencil())
@@ -459,12 +456,16 @@ void VulkanTexture::OverrideImageLayout(Layout new_layout)
   m_layout = new_layout;
 }
 
-void VulkanTexture::SetDebugName(const std::string_view& name)
+#ifdef ENABLE_GPU_OBJECT_NAMES
+
+void VulkanTexture::SetDebugName(std::string_view name)
 {
   VulkanDevice& dev = VulkanDevice::GetInstance();
   Vulkan::SetObjectName(dev.GetVulkanDevice(), m_image, name);
   Vulkan::SetObjectName(dev.GetVulkanDevice(), m_view, name);
 }
+
+#endif
 
 void VulkanTexture::TransitionToLayout(Layout layout)
 {
@@ -579,7 +580,7 @@ void VulkanTexture::TransitionSubresourcesToLayout(VkCommandBuffer command_buffe
     case Layout::FeedbackLoop:
       barrier.srcAccessMask = (aspect == VK_IMAGE_ASPECT_COLOR_BIT) ?
                                 (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                                 GetFeedbackLoopInputAccessBits()) :
+                                 VK_ACCESS_INPUT_ATTACHMENT_READ_BIT) :
                                 (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
       srcStageMask = (aspect == VK_IMAGE_ASPECT_COLOR_BIT) ?
@@ -655,7 +656,7 @@ void VulkanTexture::TransitionSubresourcesToLayout(VkCommandBuffer command_buffe
     case Layout::FeedbackLoop:
       barrier.dstAccessMask = (aspect == VK_IMAGE_ASPECT_COLOR_BIT) ?
                                 (VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                                 GetFeedbackLoopInputAccessBits()) :
+                                 VK_ACCESS_INPUT_ATTACHMENT_READ_BIT) :
                                 (VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                  VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
       dstStageMask = (aspect == VK_IMAGE_ASPECT_COLOR_BIT) ?
@@ -704,146 +705,66 @@ VkDescriptorSet VulkanTexture::GetDescriptorSetWithSampler(VkSampler sampler)
 
 void VulkanTexture::MakeReadyForSampling()
 {
-  if (m_layout == Layout::ShaderReadOnly)
+  if (m_layout == Layout::ShaderReadOnly && m_state != State::Cleared)
     return;
 
-  VulkanDevice& dev = VulkanDevice::GetInstance();
-  if (dev.InRenderPass())
-    dev.EndRenderPass();
+  const VkCommandBuffer cmdbuf = GetCommandBufferForUpdate();
+  if (m_state == State::Cleared)
+    CommitClear(cmdbuf);
 
-  TransitionToLayout(Layout::ShaderReadOnly);
+  TransitionToLayout(cmdbuf, Layout::ShaderReadOnly);
+}
+
+void VulkanTexture::GenerateMipmaps()
+{
+  DebugAssert(HasFlag(Flags::AllowGenerateMipmaps));
+
+  const VkCommandBuffer cmdbuf = GetCommandBufferForUpdate();
+
+  if (m_layout == Layout::Undefined)
+    TransitionToLayout(cmdbuf, Layout::TransferSrc);
+
+  for (u32 layer = 0; layer < m_layers; layer++)
+  {
+    for (u32 dst_level = 1; dst_level < m_levels; dst_level++)
+    {
+      const u32 src_level = dst_level - 1;
+      const u32 src_width = std::max<u32>(m_width >> src_level, 1u);
+      const u32 src_height = std::max<u32>(m_height >> src_level, 1u);
+      const u32 dst_width = std::max<u32>(m_width >> dst_level, 1u);
+      const u32 dst_height = std::max<u32>(m_height >> dst_level, 1u);
+
+      TransitionSubresourcesToLayout(cmdbuf, layer, 1, src_level, 1, m_layout, Layout::TransferSrc);
+      TransitionSubresourcesToLayout(cmdbuf, layer, 1, dst_level, 1, m_layout, Layout::TransferDst);
+
+      const VkImageBlit blit = {
+        {VK_IMAGE_ASPECT_COLOR_BIT, src_level, 0u, 1u},                              // srcSubresource
+        {{0, 0, 0}, {static_cast<s32>(src_width), static_cast<s32>(src_height), 1}}, // srcOffsets
+        {VK_IMAGE_ASPECT_COLOR_BIT, dst_level, 0u, 1u},                              // dstSubresource
+        {{0, 0, 0}, {static_cast<s32>(dst_width), static_cast<s32>(dst_height), 1}}  // dstOffsets
+      };
+
+      vkCmdBlitImage(cmdbuf, m_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_image,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+
+      TransitionSubresourcesToLayout(cmdbuf, layer, 1, src_level, 1, Layout::TransferSrc, m_layout);
+      TransitionSubresourcesToLayout(cmdbuf, layer, 1, dst_level, 1, Layout::TransferDst, m_layout);
+    }
+  }
 }
 
 std::unique_ptr<GPUTexture> VulkanDevice::CreateTexture(u32 width, u32 height, u32 layers, u32 levels, u32 samples,
-                                                        GPUTexture::Type type, GPUTexture::Format format,
-                                                        const void* data /* = nullptr */, u32 data_stride /* = 0 */,
-                                                        bool dynamic /* = false */)
+                                                        GPUTexture::Type type, GPUTextureFormat format,
+                                                        GPUTexture::Flags flags, const void* data /* = nullptr */,
+                                                        u32 data_stride /* = 0 */, Error* error /* = nullptr */)
 {
   const VkFormat vk_format = VulkanDevice::TEXTURE_FORMAT_MAPPING[static_cast<u8>(format)];
   std::unique_ptr<VulkanTexture> tex =
-    VulkanTexture::Create(width, height, layers, levels, samples, type, format, vk_format);
+    VulkanTexture::Create(width, height, layers, levels, samples, type, format, flags, vk_format, error);
   if (tex && data)
     tex->Update(0, 0, width, height, data, data_stride);
 
   return tex;
-}
-
-bool VulkanDevice::DownloadTexture(GPUTexture* texture, u32 x, u32 y, u32 width, u32 height, void* out_data,
-                                   u32 out_data_stride)
-{
-  VulkanTexture* T = static_cast<VulkanTexture*>(texture);
-  T->CommitClear();
-
-  const u32 pitch = Common::AlignUp(width * T->GetPixelSize(), GetBufferCopyRowPitchAlignment());
-  const u32 size = pitch * height;
-  const u32 level = 0;
-  if (!CheckDownloadBufferSize(size))
-  {
-    Log_ErrorPrintf("Can't read back %ux%u", width, height);
-    return false;
-  }
-
-  if (InRenderPass())
-    EndRenderPass();
-
-  const VkCommandBuffer cmdbuf = GetCurrentCommandBuffer();
-
-  VulkanTexture::Layout old_layout = T->GetLayout();
-  if (old_layout != VulkanTexture::Layout::TransferSrc)
-    T->TransitionSubresourcesToLayout(cmdbuf, 0, 1, 0, 1, old_layout, VulkanTexture::Layout::TransferSrc);
-
-  VkBufferImageCopy image_copy = {};
-  const VkImageAspectFlags aspect = T->IsDepthStencil() ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
-  image_copy.bufferOffset = 0;
-  image_copy.bufferRowLength = pitch / T->GetPixelSize();
-  image_copy.bufferImageHeight = 0;
-  image_copy.imageSubresource = {aspect, level, 0u, 1u};
-  image_copy.imageOffset = {static_cast<s32>(x), static_cast<s32>(y), 0};
-  image_copy.imageExtent = {width, height, 1u};
-
-  // do the copy
-  vkCmdCopyImageToBuffer(cmdbuf, T->GetImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_download_buffer, 1,
-                         &image_copy);
-
-  // flush gpu cache
-  const VkBufferMemoryBarrier buffer_info = {
-    VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, // VkStructureType    sType
-    nullptr,                                 // const void*        pNext
-    VK_ACCESS_TRANSFER_WRITE_BIT,            // VkAccessFlags      srcAccessMask
-    VK_ACCESS_HOST_READ_BIT,                 // VkAccessFlags      dstAccessMask
-    VK_QUEUE_FAMILY_IGNORED,                 // uint32_t           srcQueueFamilyIndex
-    VK_QUEUE_FAMILY_IGNORED,                 // uint32_t           dstQueueFamilyIndex
-    m_download_buffer,                       // VkBuffer           buffer
-    0,                                       // VkDeviceSize       offset
-    size                                     // VkDeviceSize       size
-  };
-  vkCmdPipelineBarrier(cmdbuf, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &buffer_info,
-                       0, nullptr);
-
-  if (old_layout != VulkanTexture::Layout::TransferSrc)
-    T->TransitionSubresourcesToLayout(cmdbuf, 0, 1, 0, 1, VulkanTexture::Layout::TransferSrc, old_layout);
-
-  SubmitCommandBuffer(true);
-
-  // invalidate cpu cache before reading
-  VkResult res = vmaInvalidateAllocation(m_allocator, m_download_buffer_allocation, 0, size);
-  if (res != VK_SUCCESS)
-    LOG_VULKAN_ERROR(res, "vmaInvalidateAllocation() failed, readback may be incorrect: ");
-
-  StringUtil::StrideMemCpy(out_data, out_data_stride, m_download_buffer_map, pitch, width * T->GetPixelSize(), height);
-  return true;
-}
-
-bool VulkanDevice::CheckDownloadBufferSize(u32 required_size)
-{
-  if (m_download_buffer_size >= required_size)
-    return true;
-
-  DestroyDownloadBuffer();
-
-  // Adreno has slow coherent cached reads.
-  const bool is_adreno = (m_device_properties.vendorID == 0x5143 ||
-                          m_device_driver_properties.driverID == VK_DRIVER_ID_QUALCOMM_PROPRIETARY);
-
-  const VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-                                  nullptr,
-                                  0u,
-                                  required_size,
-                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                  VK_SHARING_MODE_EXCLUSIVE,
-                                  0u,
-                                  nullptr};
-
-  VmaAllocationCreateInfo aci = {};
-  aci.usage = VMA_MEMORY_USAGE_GPU_TO_CPU;
-  aci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
-  aci.preferredFlags = is_adreno ? (VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) :
-                                   VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-
-  VmaAllocationInfo ai = {};
-  VkResult res = vmaCreateBuffer(m_allocator, &bci, &aci, &m_download_buffer, &m_download_buffer_allocation, &ai);
-  if (res != VK_SUCCESS)
-  {
-    LOG_VULKAN_ERROR(res, "vmaCreateBuffer() failed: ");
-    return false;
-  }
-
-  m_download_buffer_map = static_cast<u8*>(ai.pMappedData);
-  return true;
-}
-
-void VulkanDevice::DestroyDownloadBuffer()
-{
-  if (m_download_buffer == VK_NULL_HANDLE)
-    return;
-
-  vmaDestroyBuffer(m_allocator, m_download_buffer, m_download_buffer_allocation);
-
-  // unmapped as part of the buffer destroy
-  m_download_buffer = VK_NULL_HANDLE;
-  m_download_buffer_allocation = VK_NULL_HANDLE;
-  m_download_buffer_map = nullptr;
-  m_download_buffer_size = 0;
 }
 
 VulkanSampler::VulkanSampler(VkSampler sampler) : m_sampler(sampler)
@@ -852,24 +773,25 @@ VulkanSampler::VulkanSampler(VkSampler sampler) : m_sampler(sampler)
 
 VulkanSampler::~VulkanSampler()
 {
-  // Cleaned up by main class.
+  VulkanDevice::GetInstance().DeferSamplerDestruction(m_sampler);
 }
 
-void VulkanSampler::SetDebugName(const std::string_view& name)
+#ifdef ENABLE_GPU_OBJECT_NAMES
+
+void VulkanSampler::SetDebugName(std::string_view name)
 {
   Vulkan::SetObjectName(VulkanDevice::GetInstance().GetVulkanDevice(), m_sampler, name);
 }
 
-VkSampler VulkanDevice::GetSampler(const GPUSampler::Config& config)
-{
-  const auto it = m_sampler_map.find(config.key);
-  if (it != m_sampler_map.end())
-    return it->second;
+#endif
 
+std::unique_ptr<GPUSampler> VulkanDevice::CreateSampler(const GPUSampler::Config& config, Error* error /* = nullptr */)
+{
   static constexpr std::array<VkSamplerAddressMode, static_cast<u8>(GPUSampler::AddressMode::MaxCount)> ta = {{
     VK_SAMPLER_ADDRESS_MODE_REPEAT,          // Repeat
     VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,   // ClampToEdge
     VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, // ClampToBorder
+    VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT, // MirrorRepeat
   }};
   static constexpr std::array<VkFilter, static_cast<u8>(GPUSampler::Filter::MaxCount)> min_mag_filters = {{
     VK_FILTER_NEAREST, // Nearest
@@ -925,7 +847,7 @@ VkSampler VulkanDevice::GetSampler(const GPUSampler::Config& config)
     }
     if (i == std::size(border_color_mapping))
     {
-      Log_ErrorPrintf("Unsupported border color: %08X", config.border_color.GetValue());
+      ERROR_LOG("Unsupported border color: {:08X}", config.border_color.GetValue());
       return {};
     }
 
@@ -935,77 +857,13 @@ VkSampler VulkanDevice::GetSampler(const GPUSampler::Config& config)
   VkSampler sampler = VK_NULL_HANDLE;
   VkResult res = vkCreateSampler(m_device, &ci, nullptr, &sampler);
   if (res != VK_SUCCESS)
-    LOG_VULKAN_ERROR(res, "vkCreateSampler() failed: ");
-
-  m_sampler_map.emplace(config.key, sampler);
-  return sampler;
-}
-
-void VulkanDevice::DestroySamplers()
-{
-  for (auto& it : m_sampler_map)
   {
-    if (it.second != VK_NULL_HANDLE)
-      vkDestroySampler(m_device, it.second, nullptr);
+    LOG_VULKAN_ERROR(res, "vkCreateSampler() failed: ");
+    Vulkan::SetErrorObject(error, "vkCreateSampler() failed: ", res);
+    return {};
   }
-  m_sampler_map.clear();
-}
 
-std::unique_ptr<GPUSampler> VulkanDevice::CreateSampler(const GPUSampler::Config& config)
-{
-  const VkSampler vsampler = GetSampler(config);
-  if (vsampler == VK_NULL_HANDLE)
-    return {};
-
-  return std::unique_ptr<GPUSampler>(new VulkanSampler(vsampler));
-}
-
-VulkanFramebuffer::VulkanFramebuffer(GPUTexture* rt, GPUTexture* ds, u32 width, u32 height, VkFramebuffer fb)
-  : GPUFramebuffer(rt, ds, width, height), m_framebuffer(fb)
-{
-}
-
-VulkanFramebuffer::~VulkanFramebuffer()
-{
-  VulkanDevice::GetInstance().DeferFramebufferDestruction(m_framebuffer);
-}
-
-void VulkanFramebuffer::SetDebugName(const std::string_view& name)
-{
-  Vulkan::SetObjectName(VulkanDevice::GetInstance().GetVulkanDevice(), m_framebuffer, name);
-}
-
-std::unique_ptr<GPUFramebuffer> VulkanDevice::CreateFramebuffer(GPUTexture* rt_or_ds, GPUTexture* ds /*= nullptr*/)
-{
-  DebugAssert((rt_or_ds || ds) && (!rt_or_ds || rt_or_ds->IsRenderTarget() || (rt_or_ds->IsDepthStencil() && !ds)));
-  VulkanTexture* RT = static_cast<VulkanTexture*>((rt_or_ds && rt_or_ds->IsDepthStencil()) ? nullptr : rt_or_ds);
-  VulkanTexture* DS = static_cast<VulkanTexture*>((rt_or_ds && rt_or_ds->IsDepthStencil()) ? rt_or_ds : ds);
-
-  const u32 width = RT ? RT->GetWidth() : DS->GetWidth();
-  const u32 height = RT ? RT->GetHeight() : DS->GetHeight();
-
-  const VkRenderPass render_pass =
-    GetRenderPass(RT ? RT->GetVkFormat() : VK_FORMAT_UNDEFINED, DS ? DS->GetVkFormat() : VK_FORMAT_UNDEFINED,
-                  static_cast<VkSampleCountFlagBits>(RT ? RT->GetSamples() : DS->GetSamples()),
-                  RT ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-                  RT ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-                  DS ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-                  DS ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE);
-  DebugAssert(render_pass != VK_NULL_HANDLE);
-
-  Vulkan::FramebufferBuilder fbb;
-  fbb.SetRenderPass(render_pass);
-  fbb.SetSize(width, height, 1);
-  if (RT)
-    fbb.AddAttachment(RT->GetView());
-  if (DS)
-    fbb.AddAttachment(DS->GetView());
-
-  const VkFramebuffer fb = fbb.Create(m_device, false);
-  if (fb == VK_NULL_HANDLE)
-    return {};
-
-  return std::unique_ptr<GPUFramebuffer>(new VulkanFramebuffer(RT, DS, width, height, fb));
+  return std::unique_ptr<GPUSampler>(new VulkanSampler(sampler));
 }
 
 VulkanTextureBuffer::VulkanTextureBuffer(Format format, u32 size_in_elements)
@@ -1060,10 +918,15 @@ void* VulkanTextureBuffer::Map(u32 required_elements)
 
 void VulkanTextureBuffer::Unmap(u32 used_elements)
 {
-  m_buffer.CommitMemory(GetElementSize(m_format) * used_elements);
+  const u32 size = GetElementSize(m_format) * used_elements;
+  GPUDevice::GetStatistics().buffer_streamed += size;
+  GPUDevice::GetStatistics().num_uploads++;
+  m_buffer.CommitMemory(size);
 }
 
-void VulkanTextureBuffer::SetDebugName(const std::string_view& name)
+#ifdef ENABLE_GPU_OBJECT_NAMES
+
+void VulkanTextureBuffer::SetDebugName(std::string_view name)
 {
   VulkanDevice& dev = VulkanDevice::GetInstance();
   Vulkan::SetObjectName(dev.GetVulkanDevice(), m_buffer.GetBuffer(), name);
@@ -1071,8 +934,10 @@ void VulkanTextureBuffer::SetDebugName(const std::string_view& name)
     Vulkan::SetObjectName(dev.GetVulkanDevice(), m_buffer_view, name);
 }
 
+#endif
+
 std::unique_ptr<GPUTextureBuffer> VulkanDevice::CreateTextureBuffer(GPUTextureBuffer::Format format,
-                                                                    u32 size_in_elements)
+                                                                    u32 size_in_elements, Error* error)
 {
   static constexpr std::array<VkFormat, static_cast<u8>(GPUTextureBuffer::Format::MaxCount)> format_mapping = {{
     VK_FORMAT_R16_UINT, // R16UI
@@ -1086,7 +951,7 @@ std::unique_ptr<GPUTextureBuffer> VulkanDevice::CreateTextureBuffer(GPUTextureBu
   tb->m_descriptor_set = AllocatePersistentDescriptorSet(m_single_texture_buffer_ds_layout);
   if (tb->m_descriptor_set == VK_NULL_HANDLE)
   {
-    Log_ErrorPrintf("Failed to allocate persistent descriptor set for texture buffer.");
+    Error::SetStringView(error, "Failed to allocate persistent descriptor set for texture buffer.");
     tb->Destroy(false);
     return {};
   }
@@ -1103,7 +968,7 @@ std::unique_ptr<GPUTextureBuffer> VulkanDevice::CreateTextureBuffer(GPUTextureBu
     bvb.Set(tb->GetBuffer(), format_mapping[static_cast<u8>(format)], 0, tb->GetSizeInBytes());
     if ((tb->m_buffer_view = bvb.Create(m_device, false)) == VK_NULL_HANDLE)
     {
-      Log_ErrorPrintf("Failed to create buffer view for texture buffer.");
+      ERROR_LOG("Failed to create buffer view for texture buffer.");
       tb->Destroy(false);
       return {};
     }
@@ -1114,4 +979,229 @@ std::unique_ptr<GPUTextureBuffer> VulkanDevice::CreateTextureBuffer(GPUTextureBu
   dsub.Update(m_device, false);
 
   return tb;
+}
+
+VulkanDownloadTexture::VulkanDownloadTexture(u32 width, u32 height, GPUTextureFormat format, VmaAllocation allocation,
+                                             VkDeviceMemory memory, VkBuffer buffer, VkDeviceSize memory_offset,
+                                             const u8* map_ptr, u32 map_pitch)
+  : GPUDownloadTexture(width, height, format, (memory != VK_NULL_HANDLE)), m_allocation(allocation), m_memory(memory),
+    m_buffer(buffer), m_memory_offset(memory_offset)
+{
+  m_map_pointer = map_ptr;
+  m_current_pitch = map_pitch;
+}
+
+VulkanDownloadTexture::~VulkanDownloadTexture()
+{
+  if (m_allocation != VK_NULL_HANDLE)
+  {
+    // Buffer was created mapped, no need to manually unmap.
+    VulkanDevice::GetInstance().DeferBufferDestruction(m_buffer, m_allocation);
+  }
+  else
+  {
+    // imported
+    DebugAssert(m_is_imported && m_memory != VK_NULL_HANDLE);
+    VulkanDevice::GetInstance().DeferBufferDestruction(m_buffer, m_memory);
+  }
+}
+
+std::unique_ptr<VulkanDownloadTexture> VulkanDownloadTexture::Create(u32 width, u32 height, GPUTextureFormat format,
+                                                                     void* memory, size_t memory_size,
+                                                                     u32 memory_stride, Error* error)
+{
+  VulkanDevice& dev = VulkanDevice::GetInstance();
+  VmaAllocation allocation = VK_NULL_HANDLE;
+  VkDeviceMemory dev_memory = VK_NULL_HANDLE;
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VkDeviceSize memory_offset = 0;
+  const u8* map_ptr = nullptr;
+  u32 map_pitch = 0;
+  u32 buffer_size = 0;
+
+  // not importing memory?
+  if (!memory)
+  {
+    map_pitch = Common::AlignUpPow2(GPUTexture::CalcUploadPitch(format, width), dev.GetBufferCopyRowPitchAlignment());
+    buffer_size = height * map_pitch;
+
+    const VkBufferCreateInfo bci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                    nullptr,
+                                    0u,
+                                    buffer_size,
+                                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                    VK_SHARING_MODE_EXCLUSIVE,
+                                    0u,
+                                    nullptr};
+
+    VmaAllocationCreateInfo aci = {};
+    aci.usage = VMA_MEMORY_USAGE_GPU_TO_CPU;
+    aci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    aci.preferredFlags = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+
+    VmaAllocationInfo ai = {};
+    VkResult res = vmaCreateBuffer(VulkanDevice::GetInstance().GetAllocator(), &bci, &aci, &buffer, &allocation, &ai);
+    if (res != VK_SUCCESS)
+    {
+      Vulkan::SetErrorObject(error, "vmaCreateBuffer() failed: ", res);
+      return {};
+    }
+
+    DebugAssert(ai.pMappedData);
+    map_ptr = static_cast<u8*>(ai.pMappedData);
+  }
+  else
+  {
+    map_pitch = memory_stride;
+    buffer_size = height * map_pitch;
+    Assert(buffer_size <= memory_size);
+
+    if (!dev.TryImportHostMemory(memory, memory_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &dev_memory, &buffer,
+                                 &memory_offset, error))
+    {
+      return {};
+    }
+
+    map_ptr = static_cast<u8*>(memory);
+  }
+
+  return std::unique_ptr<VulkanDownloadTexture>(new VulkanDownloadTexture(width, height, format, allocation, dev_memory,
+                                                                          buffer, memory_offset, map_ptr, map_pitch));
+}
+
+void VulkanDownloadTexture::CopyFromTexture(u32 dst_x, u32 dst_y, GPUTexture* src, u32 src_x, u32 src_y, u32 width,
+                                            u32 height, u32 src_layer, u32 src_level, bool use_transfer_pitch)
+{
+  VulkanTexture* const vkTex = static_cast<VulkanTexture*>(src);
+  VulkanDevice& dev = VulkanDevice::GetInstance();
+
+  DebugAssert(vkTex->GetFormat() == m_format);
+  DebugAssert(src_level < vkTex->GetLevels());
+  DebugAssert((src_x + width) <= src->GetMipWidth(src_level) && (src_y + height) <= src->GetMipHeight(src_level));
+  DebugAssert((dst_x + width) <= m_width && (dst_y + height) <= m_height);
+  DebugAssert((dst_x == 0 && dst_y == 0) || !use_transfer_pitch);
+  DebugAssert(!m_is_imported || !use_transfer_pitch);
+
+  u32 copy_offset, copy_size, copy_rows;
+  if (!m_is_imported)
+    m_current_pitch = GetTransferPitch(use_transfer_pitch ? width : m_width, dev.GetBufferCopyRowPitchAlignment());
+  GetTransferSize(dst_x, dst_y, width, height, m_current_pitch, &copy_offset, &copy_size, &copy_rows);
+
+  dev.GetStatistics().num_downloads++;
+  if (dev.InRenderPass())
+    dev.EndRenderPass();
+  vkTex->CommitClear();
+
+  const VkCommandBuffer cmdbuf = dev.GetCurrentCommandBuffer();
+  GL_INS_FMT("VulkanDownloadTexture::CopyFromTexture: {{{},{}}} {}x{} => {{{},{}}}", src_x, src_y, width, height, dst_x,
+             dst_y);
+
+  VulkanTexture::Layout old_layout = vkTex->GetLayout();
+  if (old_layout == VulkanTexture::Layout::Undefined)
+    vkTex->TransitionToLayout(cmdbuf, VulkanTexture::Layout::TransferSrc);
+  else if (old_layout != VulkanTexture::Layout::TransferSrc)
+    vkTex->TransitionSubresourcesToLayout(cmdbuf, 0, 1, src_level, 1, old_layout, VulkanTexture::Layout::TransferSrc);
+
+  VkBufferImageCopy image_copy = {};
+  const VkImageAspectFlags aspect = vkTex->IsDepthStencil() ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+  image_copy.bufferOffset = m_memory_offset + copy_offset;
+  image_copy.bufferRowLength = GPUTexture::CalcUploadRowLengthFromPitch(m_format, m_current_pitch);
+  image_copy.bufferImageHeight = 0;
+  image_copy.imageSubresource = {aspect, src_level, src_layer, 1u};
+  image_copy.imageOffset = {static_cast<s32>(src_x), static_cast<s32>(src_y), 0};
+  image_copy.imageExtent = {width, height, 1u};
+
+  // do the copy
+  vkCmdCopyImageToBuffer(cmdbuf, vkTex->GetImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_buffer, 1, &image_copy);
+
+  // flush gpu cache
+  const VkBufferMemoryBarrier buffer_info = {
+    VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, // VkStructureType    sType
+    nullptr,                                 // const void*        pNext
+    VK_ACCESS_TRANSFER_WRITE_BIT,            // VkAccessFlags      srcAccessMask
+    VK_ACCESS_HOST_READ_BIT,                 // VkAccessFlags      dstAccessMask
+    VK_QUEUE_FAMILY_IGNORED,                 // uint32_t           srcQueueFamilyIndex
+    VK_QUEUE_FAMILY_IGNORED,                 // uint32_t           dstQueueFamilyIndex
+    m_buffer,                                // VkBuffer           buffer
+    0,                                       // VkDeviceSize       offset
+    copy_size                                // VkDeviceSize       size
+  };
+  vkCmdPipelineBarrier(cmdbuf, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &buffer_info,
+                       0, nullptr);
+
+  if (old_layout != VulkanTexture::Layout::TransferSrc && old_layout != VulkanTexture::Layout::Undefined)
+    vkTex->TransitionSubresourcesToLayout(cmdbuf, 0, 1, src_level, 1, VulkanTexture::Layout::TransferSrc, old_layout);
+
+  m_copy_fence_counter = dev.GetCurrentFenceCounter();
+  m_needs_cache_invalidate = true;
+  m_needs_flush = true;
+}
+
+bool VulkanDownloadTexture::Map(u32 x, u32 y, u32 width, u32 height)
+{
+  // Always mapped, but we might need to invalidate the cache.
+  if (m_needs_cache_invalidate)
+  {
+    u32 copy_offset, copy_size, copy_rows;
+    GetTransferSize(x, y, width, height, m_current_pitch, &copy_offset, &copy_size, &copy_rows);
+    vmaInvalidateAllocation(VulkanDevice::GetInstance().GetAllocator(), m_allocation, copy_offset,
+                            m_current_pitch * copy_rows);
+    m_needs_cache_invalidate = false;
+  }
+
+  return true;
+}
+
+void VulkanDownloadTexture::Unmap()
+{
+  // Always mapped.
+}
+
+void VulkanDownloadTexture::Flush()
+{
+  if (!m_needs_flush)
+    return;
+
+  m_needs_flush = false;
+
+  VulkanDevice& dev = VulkanDevice::GetInstance();
+  if (dev.GetCompletedFenceCounter() >= m_copy_fence_counter)
+    return;
+
+  // Need to execute command buffer.
+  if (dev.GetCurrentFenceCounter() == m_copy_fence_counter)
+  {
+    if (dev.InRenderPass())
+      dev.EndRenderPass();
+    dev.SubmitCommandBuffer(true);
+  }
+  else
+  {
+    dev.WaitForFenceCounter(m_copy_fence_counter);
+  }
+}
+
+#ifdef ENABLE_GPU_OBJECT_NAMES
+
+void VulkanDownloadTexture::SetDebugName(std::string_view name)
+{
+  if (name.empty())
+    return;
+
+  Vulkan::SetObjectName(VulkanDevice::GetInstance().GetVulkanDevice(), m_buffer, name);
+}
+
+#endif
+
+std::unique_ptr<GPUDownloadTexture> VulkanDevice::CreateDownloadTexture(u32 width, u32 height, GPUTextureFormat format,
+                                                                        Error* error /* = nullptr */)
+{
+  return VulkanDownloadTexture::Create(width, height, format, nullptr, 0, 0, error);
+}
+
+std::unique_ptr<GPUDownloadTexture> VulkanDevice::CreateDownloadTexture(u32 width, u32 height, GPUTextureFormat format,
+                                                                        void* memory, size_t memory_size,
+                                                                        u32 memory_stride, Error* error /* = nullptr */)
+{
+  return VulkanDownloadTexture::Create(width, height, format, memory, memory_size, memory_stride, error);
 }

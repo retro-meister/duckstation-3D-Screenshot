@@ -1,14 +1,13 @@
-// SPDX-FileCopyrightText: 2019-2022 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
-#include <string>
 #include <QtWidgets/QWidget>
+#include <string>
 
 #include "ui_gamelistsettingswidget.h"
 
 class SettingsWindow;
-class GameListSearchDirectoriesModel;
 
 class GameListSettingsWidget : public QWidget
 {
@@ -18,27 +17,28 @@ public:
   GameListSettingsWidget(SettingsWindow* dialog, QWidget* parent);
   ~GameListSettingsWidget();
 
-  bool addExcludedPath(const std::string& path);
+  bool addExcludedPath(const QString& path);
   void refreshExclusionList();
 
-public Q_SLOTS:
   void addSearchDirectory(QWidget* parent_widget);
 
-private Q_SLOTS:
-  void onDirectoryListItemClicked(const QModelIndex& index);
+private:
+  void addPathToTable(const std::string& path, bool recursive);
+  void refreshDirectoryList();
+  void addSearchDirectory(const QString& path, bool recursive);
+  void removeSearchDirectory(const QString& path);
+
+  void onDirectoryListSelectionChanged();
+  void onDirectoryListItemChanged(QTreeWidgetItem* item, int column);
   void onDirectoryListContextMenuRequested(const QPoint& point);
   void onAddSearchDirectoryButtonClicked();
   void onRemoveSearchDirectoryButtonClicked();
-  void onAddExcludedPathButtonClicked();
+  void onAddExcludedFileButtonClicked();
+  void onAddExcludedFolderButtonClicked();
   void onRemoveExcludedPathButtonClicked();
+  void onExcludedPathsSelectionChanged();
   void onScanForNewGamesClicked();
   void onRescanAllGamesClicked();
 
-protected:
-  void resizeEvent(QResizeEvent* event);
-
-private:
   Ui::GameListSettingsWidget m_ui;
-
-  GameListSearchDirectoriesModel* m_search_directories_model = nullptr;
 };

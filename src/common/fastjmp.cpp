@@ -1,7 +1,8 @@
-// SPDX-FileCopyrightText: 2021 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
-#if !defined(_MSC_VER) || defined(__clang__)
+// Win32 uses Fastjmp.asm, because MSVC doesn't support inline asm.
+#if !defined(_WIN32) || defined(_M_ARM64)
 
 #include "fastjmp.h"
 
@@ -11,13 +12,14 @@
 #define PREFIX ""
 #endif
 
+// clang-format off
+
 #if defined(__x86_64__)
 
 asm("\t.global " PREFIX "fastjmp_set\n"
-    "\t.global " PREFIX "fastjmp_jmp\n"
-    "\t.text\n"
-    "\t" PREFIX "fastjmp_set:"
-    R"(
+	"\t.global " PREFIX "fastjmp_jmp\n"
+	"\t.text\n"
+	"\t" PREFIX "fastjmp_set:" R"(
 	movq 0(%rsp), %rax
 	movq %rsp, %rdx			# fixup stack pointer, so it doesn't include the call to fastjmp_set
 	addq $8, %rdx
@@ -32,8 +34,7 @@ asm("\t.global " PREFIX "fastjmp_set\n"
 	xorl %eax, %eax
 	ret
 )"
-    "\t" PREFIX "fastjmp_jmp:"
-    R"(
+	"\t" PREFIX "fastjmp_jmp:" R"(
 	movl %esi, %eax
 	movq 0(%rdi), %rdx	# actually rip
 	movq 8(%rdi), %rbx
@@ -94,20 +95,20 @@ asm(
 	"\t.global " PREFIX "fastjmp_jmp\n"
 	"\t.text\n"
 	"\t" PREFIX "fastjmp_set:" R"(
-        vstmia r0!, {d8-d15}
-        stmia r0!, {r4-r14}
-        fmrx r1, fpscr
-        str r1, [r0]
-        mov r0, #0
-        bx lr
+	vstmia r0!, {d8-d15}
+	stmia r0!, {r4-r14}
+	fmrx r1, fpscr
+	str r1, [r0]
+	mov r0, #0
+	bx lr
 )"
 
 "\t" PREFIX "fastjmp_jmp:" R"(
-        vldmia r0!, {d8-d15}
-        ldmia r0!, {r4-r14}
+	vldmia r0!, {d8-d15}
+	ldmia r0!, {r4-r14}
 	ldr r0, [r0]
 	fmxr fpscr, r0
-        mov r0, r1
+	mov r0, r1
 	bx lr
 )");
 
@@ -116,68 +117,126 @@ asm(
 asm(
 	"\t.global " PREFIX "fastjmp_set\n"
 	"\t.global " PREFIX "fastjmp_jmp\n"
+	"\t.attribute arch, \"rv64gc\"\n"
 	"\t.text\n"
 	"\t.align 16\n"
 	"\t" PREFIX "fastjmp_set:" R"(
-  sd sp, 0(a0)
-  sd s0, 8(a0)
-  sd s1, 16(a0)
-  sd s2, 24(a0)
-  sd s3, 32(a0)
-  sd s4, 40(a0)
-  sd s5, 48(a0)
-  sd s6, 56(a0)
-  sd s7, 64(a0)
-  sd s8, 72(a0)
-  sd s9, 80(a0)
-  sd s10, 88(a0)
-  sd s11, 96(a0)
-  fsd fs0, 104(a0)
-  fsd fs1, 112(a0)
-  fsd fs2, 120(a0)
-  fsd fs3, 128(a0)
-  fsd fs4, 136(a0)
-  fsd fs5, 144(a0)
-  fsd fs6, 152(a0)
-  fsd fs7, 160(a0)
-  fsd fs8, 168(a0)
-  fsd fs9, 176(a0)
-  fsd fs10, 184(a0)
-  fsd fs11, 192(a0)
-  sd ra, 208(a0)
-  li a0, 0
-  jr ra
+	sd sp, 0(a0)
+	sd s0, 8(a0)
+	sd s1, 16(a0)
+	sd s2, 24(a0)
+	sd s3, 32(a0)
+	sd s4, 40(a0)
+	sd s5, 48(a0)
+	sd s6, 56(a0)
+	sd s7, 64(a0)
+	sd s8, 72(a0)
+	sd s9, 80(a0)
+	sd s10, 88(a0)
+	sd s11, 96(a0)
+	fsd fs0, 104(a0)
+	fsd fs1, 112(a0)
+	fsd fs2, 120(a0)
+	fsd fs3, 128(a0)
+	fsd fs4, 136(a0)
+	fsd fs5, 144(a0)
+	fsd fs6, 152(a0)
+	fsd fs7, 160(a0)
+	fsd fs8, 168(a0)
+	fsd fs9, 176(a0)
+	fsd fs10, 184(a0)
+	fsd fs11, 192(a0)
+	sd ra, 208(a0)
+	li a0, 0
+	jr ra
 )"
 ".align 16\n"
 "\t" PREFIX "fastjmp_jmp:" R"(
-  ld ra, 208(a0)
-  fld fs11, 192(a0)
-  fld fs10, 184(a0)
-  fld fs9, 176(a0)
-  fld fs8, 168(a0)
-  fld fs7, 160(a0)
-  fld fs6, 152(a0)
-  fld fs5, 144(a0)
-  fld fs4, 136(a0)
-  fld fs3, 128(a0)
-  fld fs2, 120(a0)
-  fld fs1, 112(a0)
-  fld fs0, 104(a0)
-  ld s11, 96(a0)
-  ld s10, 88(a0)
-  ld s9, 80(a0)
-  ld s8, 72(a0)
-  ld s7, 64(a0)
-  ld s6, 56(a0)
-  ld s5, 48(a0)
-  ld s4, 40(a0)
-  ld s3, 32(a0)
-  ld s2, 24(a0)
-  ld s1, 16(a0)
-  ld s0, 8(a0)
-  ld sp, 0(a0)
-  mv a0, a1
-  jr ra
+	ld ra, 208(a0)
+	fld fs11, 192(a0)
+	fld fs10, 184(a0)
+	fld fs9, 176(a0)
+	fld fs8, 168(a0)
+	fld fs7, 160(a0)
+	fld fs6, 152(a0)
+	fld fs5, 144(a0)
+	fld fs4, 136(a0)
+	fld fs3, 128(a0)
+	fld fs2, 120(a0)
+	fld fs1, 112(a0)
+	fld fs0, 104(a0)
+	ld s11, 96(a0)
+	ld s10, 88(a0)
+	ld s9, 80(a0)
+	ld s8, 72(a0)
+	ld s7, 64(a0)
+	ld s6, 56(a0)
+	ld s5, 48(a0)
+	ld s4, 40(a0)
+	ld s3, 32(a0)
+	ld s2, 24(a0)
+	ld s1, 16(a0)
+	ld s0, 8(a0)
+	ld sp, 0(a0)
+	mv a0, a1
+	jr ra
+)");
+
+#elif defined(__loongarch64)
+
+asm(
+	"\t.global " PREFIX "fastjmp_set\n"
+	"\t.global " PREFIX "fastjmp_jmp\n"
+	"\t.text\n"
+	"\t.align 16\n"
+	"\t" PREFIX "fastjmp_set:" R"(
+	st.d $sp, $a0, 0
+	st.d $s0, $a0, 8
+	st.d $s1, $a0, 16
+	st.d $s2, $a0, 24
+	st.d $s3, $a0, 32
+	st.d $s4, $a0, 40
+	st.d $s5, $a0, 48
+	st.d $s6, $a0, 56
+	st.d $s7, $a0, 64
+	st.d $s8, $a0, 72
+	st.d $s9, $a0, 80
+	fst.d $fs0, $a0, 88
+	fst.d $fs1, $a0, 96
+	fst.d $fs2, $a0, 104
+	fst.d $fs3, $a0, 112
+	fst.d $fs4, $a0, 120
+	fst.d $fs5, $a0, 128
+	fst.d $fs6, $a0, 136
+	fst.d $fs7, $a0, 144
+	st.d $ra, $a0, 152
+	addi.d $a0, $zero, 0
+	jirl $zero, $ra, 0
+)"
+".align 16\n"
+"\t" PREFIX "fastjmp_jmp:" R"(
+	ld.d $ra, $a0, 152
+	fld.d $fs7, $a0, 144
+	fld.d $fs6, $a0, 136
+	fld.d $fs5, $a0, 128
+	fld.d $fs4, $a0, 120
+	fld.d $fs3, $a0, 112
+	fld.d $fs2, $a0, 104
+	fld.d $fs1, $a0, 96
+	fld.d $fs0, $a0, 88
+	ld.d $s9, $a0, 80
+	ld.d $s8, $a0, 72
+	ld.d $s7, $a0, 64
+	ld.d $s6, $a0, 56
+	ld.d $s5, $a0, 48
+	ld.d $s4, $a0, 40
+	ld.d $s3, $a0, 32
+	ld.d $s2, $a0, 24
+	ld.d $s1, $a0, 16
+	ld.d $s0, $a0, 8
+	ld.d $sp, $a0, 0
+	move $a0, $a1
+	jirl $zero, $ra, 0
 )");
 
 
@@ -186,5 +245,7 @@ asm(
 #error Unknown platform.
 
 #endif
+
+// clang-format on
 
 #endif // __WIN32

@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2019-2022 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 #include "util/cd_image.h"
@@ -37,7 +37,7 @@ public:
   bool HasMedia() const { return static_cast<bool>(m_media); }
   const CDImage* GetMedia() const { return m_media.get(); }
   CDImage* GetMedia() { return m_media.get(); }
-  const std::string& GetMediaFileName() const { return m_media->GetFileName(); }
+  const std::string& GetMediaPath() const { return m_media->GetPath(); }
 
   bool IsUsingThread() const { return m_read_thread.joinable(); }
   void StartThread(u32 readahead_count = 8);
@@ -47,7 +47,7 @@ public:
   std::unique_ptr<CDImage> RemoveMedia();
 
   /// Precaches image, either to memory, or using the underlying image precache.
-  bool Precache(ProgressCallback* callback);
+  bool Precache(ProgressCallback* callback, Error* error);
 
   void QueueReadSector(CDImage::LBA lba);
 

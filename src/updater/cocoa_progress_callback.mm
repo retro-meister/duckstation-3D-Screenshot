@@ -1,13 +1,14 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "cocoa_progress_callback.h"
 
+#include "common/cocoa_tools.h"
 #include "common/log.h"
 
-Log_SetChannel(CocoaProgressCallback);
+LOG_CHANNEL(Host);
 
-CocoaProgressCallback::CocoaProgressCallback() : BaseProgressCallback()
+CocoaProgressCallback::CocoaProgressCallback() : UpdaterProgressCallback()
 {
   Create();
 }
@@ -17,49 +18,14 @@ CocoaProgressCallback::~CocoaProgressCallback()
   Destroy();
 }
 
-void CocoaProgressCallback::PushState()
+void CocoaProgressCallback::SetTitle(const std::string_view title)
 {
-  BaseProgressCallback::PushState();
-}
-
-void CocoaProgressCallback::PopState()
-{
-  BaseProgressCallback::PopState();
-  UpdateProgress();
-}
-
-void CocoaProgressCallback::SetCancellable(bool cancellable)
-{
-  BaseProgressCallback::SetCancellable(cancellable);
-}
-
-void CocoaProgressCallback::SetTitle(const char* title)
-{
-  dispatch_async(dispatch_get_main_queue(), [this, title = [[NSString alloc] initWithUTF8String:title]]() {
-    [m_window setTitle:title];
-    [title release];
-  });
-}
-
-void CocoaProgressCallback::SetStatusText(const char* text)
-{
-  BaseProgressCallback::SetStatusText(text);
-  dispatch_async(dispatch_get_main_queue(), [this, title = [[NSString alloc] initWithUTF8String:text]]() {
-    [m_status setStringValue:title];
-    [title release];
-  });
-}
-
-void CocoaProgressCallback::SetProgressRange(u32 range)
-{
-  BaseProgressCallback::SetProgressRange(range);
-  UpdateProgress();
-}
-
-void CocoaProgressCallback::SetProgressValue(u32 value)
-{
-  BaseProgressCallback::SetProgressValue(value);
-  UpdateProgress();
+  @autoreleasepool {
+    dispatch_async(dispatch_get_main_queue(), [this, title = [CocoaTools::StringViewToNSString(title) retain]]() {
+      [m_window setTitle:title];
+      [title release];
+    });
+  }
 }
 
 bool CocoaProgressCallback::Create()
@@ -140,37 +106,50 @@ void CocoaProgressCallback::Destroy()
   m_window = nil;
 }
 
-void CocoaProgressCallback::UpdateProgress()
+void CocoaProgressCallback::StateChanged(StateChange changed)
 {
-  const float percent = (static_cast<float>(m_progress_value) / static_cast<float>(m_progress_range)) * 100.0f;
-  dispatch_async(dispatch_get_main_queue(), [this, percent]() {
-    [m_progress setDoubleValue:percent];
-  });
+  if (changed & STATE_CHANGE_STATUS_TEXT)
+  {
+    @autoreleasepool {
+      dispatch_async(dispatch_get_main_queue(), [this, text = [CocoaTools::StringViewToNSString(m_status_text) retain]]() {
+        [m_status setStringValue:text];
+        [text release];
+      });
+    }
+  }
+
+  if (changed & STATE_CHANGE_PROGRESS)
+  {
+    const float percent = (static_cast<float>(m_progress_value) / static_cast<float>(m_progress_range)) * 100.0f;
+    dispatch_async(dispatch_get_main_queue(), [this, percent]() {
+      [m_progress setDoubleValue:percent];
+    });
+  }
 }
 
-void CocoaProgressCallback::DisplayError(const char* message)
+void CocoaProgressCallback::DisplayError(const std::string_view message)
 {
-  Log_ErrorPrint(message);
+  ERROR_LOG(message);
   AppendMessage(message);
 }
 
-void CocoaProgressCallback::DisplayWarning(const char* message)
+void CocoaProgressCallback::DisplayWarning(const std::string_view message)
 {
-  Log_WarningPrint(message);
+  WARNING_LOG(message);
   AppendMessage(message);
 }
 
-void CocoaProgressCallback::DisplayInformation(const char* message)
+void CocoaProgressCallback::DisplayInformation(const std::string_view message)
 {
-  Log_InfoPrint(message);
+  INFO_LOG(message);
   AppendMessage(message);
 }
 
-void CocoaProgressCallback::AppendMessage(const char* message)
+void CocoaProgressCallback::AppendMessage(const std::string_view message)
 {
   @autoreleasepool
   {
-    NSString* nsmessage = [[[NSString stringWithUTF8String:message] stringByAppendingString:@"\n"] retain];
+    NSString* nsmessage = [[CocoaTools::StringViewToNSString(message) stringByAppendingString:@"\n"] retain];
     dispatch_async(dispatch_get_main_queue(), [this, nsmessage]() {
       @autoreleasepool
       {
@@ -183,12 +162,12 @@ void CocoaProgressCallback::AppendMessage(const char* message)
   }
 }
 
-void CocoaProgressCallback::DisplayDebugMessage(const char* message)
+void CocoaProgressCallback::DisplayDebugMessage(const std::string_view message)
 {
-  Log_DevPrint(message);
+  DEV_LOG(message);
 }
 
-void CocoaProgressCallback::ModalError(const char* message)
+void CocoaProgressCallback::ModalError(const std::string_view message)
 {
   if (![NSThread isMainThread])
   {
@@ -199,13 +178,13 @@ void CocoaProgressCallback::ModalError(const char* message)
   @autoreleasepool
   {
     NSAlert* alert = [[[NSAlert alloc] init] autorelease];
-    [alert setMessageText:[NSString stringWithUTF8String:message]];
+    [alert setMessageText:CocoaTools::StringViewToNSString(message)];
     [alert setAlertStyle:NSAlertStyleCritical];
     [alert runModal];
   }
 }
 
-bool CocoaProgressCallback::ModalConfirmation(const char* message)
+bool CocoaProgressCallback::ModalConfirmation(const std::string_view message)
 {
   if (![NSThread isMainThread])
   {
@@ -218,7 +197,7 @@ bool CocoaProgressCallback::ModalConfirmation(const char* message)
   @autoreleasepool
   {
     NSAlert* alert = [[[NSAlert alloc] init] autorelease];
-    [alert setMessageText:[NSString stringWithUTF8String:message]];
+    [alert setMessageText:CocoaTools::StringViewToNSString(message)];
     [alert addButtonWithTitle:@"Yes"];
     [alert addButtonWithTitle:@"No"];
     result = ([alert runModal] == NSAlertFirstButtonReturn);
@@ -227,7 +206,7 @@ bool CocoaProgressCallback::ModalConfirmation(const char* message)
   return result;
 }
 
-void CocoaProgressCallback::ModalInformation(const char* message)
+void CocoaProgressCallback::ModalInformation(const std::string_view message)
 {
   if (![NSThread isMainThread])
   {
@@ -238,7 +217,7 @@ void CocoaProgressCallback::ModalInformation(const char* message)
   @autoreleasepool
   {
     NSAlert* alert = [[[NSAlert alloc] init] autorelease];
-    [alert setMessageText:[NSString stringWithUTF8String:message]];
+    [alert setMessageText:CocoaTools::StringViewToNSString(message)];
     [alert runModal];
   }
 }

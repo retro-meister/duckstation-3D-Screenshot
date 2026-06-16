@@ -294,6 +294,9 @@ set_timeout(struct timeval * timeout, unsigned int ms)
 static void
 stream_buffer_decrement(cubeb_stream * stm, long count)
 {
+  if (count < 0 || (snd_pcm_uframes_t)count > stm->bufframes) {
+    count = stm->bufframes;
+  }
   char * bufremains =
       stm->buffer + WRAP(snd_pcm_frames_to_bytes)(stm->pcm, count);
   memmove(stm->buffer, bufremains,
@@ -1472,6 +1475,7 @@ static struct cubeb_ops const alsa_ops = {
     .get_max_channel_count = alsa_get_max_channel_count,
     .get_min_latency = alsa_get_min_latency,
     .get_preferred_sample_rate = alsa_get_preferred_sample_rate,
+    .get_supported_input_processing_params = NULL,
     .enumerate_devices = alsa_enumerate_devices,
     .device_collection_destroy = alsa_device_collection_destroy,
     .destroy = alsa_destroy,
@@ -1485,6 +1489,8 @@ static struct cubeb_ops const alsa_ops = {
     .stream_set_volume = alsa_stream_set_volume,
     .stream_set_name = NULL,
     .stream_get_current_device = NULL,
+    .stream_set_input_mute = NULL,
+    .stream_set_input_processing_params = NULL,
     .stream_device_destroy = NULL,
     .stream_register_device_changed_callback = NULL,
     .register_device_collection_changed = NULL};

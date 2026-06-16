@@ -1,16 +1,17 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com> and contributors.
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com> and contributors.
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "cd_image.h"
-#include "cd_subchannel_replacement.h"
 
 #include "common/assert.h"
+#include "common/bcdutils.h"
 #include "common/error.h"
 #include "common/file_system.h"
 #include "common/log.h"
 #include "common/path.h"
 #include "common/string_util.h"
 
+#include "fmt/format.h"
 #include "zlib.h"
 
 #include <array>
@@ -21,7 +22,7 @@
 #include <variant>
 #include <vector>
 
-Log_SetChannel(CDImagePBP);
+LOG_CHANNEL(CDImage);
 
 namespace {
 
@@ -133,15 +134,13 @@ public:
 
   bool Open(const char* filename, Error* error);
 
-  bool ReadSubChannelQ(SubChannelQ* subq, const Index& index, LBA lba_in_index) override;
-  bool HasNonStandardSubchannel() const override;
+  s64 GetSizeOnDisk() const override;
 
   bool HasSubImages() const override;
   u32 GetSubImageCount() const override;
   u32 GetCurrentSubImage() const override;
   bool SwitchSubImage(u32 index, Error* error) override;
-  std::string GetMetadata(const std::string_view& type) const override;
-  std::string GetSubImageMetadata(u32 index, const std::string_view& type) const override;
+  std::string GetSubImageTitle(u32 index) const override;
 
 protected:
   bool ReadSectorFromIndex(void* buffer, const Index& index, LBA lba_in_index) override;
@@ -153,17 +152,17 @@ private:
     u16 size;
   };
 
-#if _DEBUG
+#if defined(_DEBUG) || defined(_DEVEL)
   static void PrintPBPHeaderInfo(const PBPHeader& pbp_header);
   static void PrintSFOHeaderInfo(const SFOHeader& sfo_header);
   static void PrintSFOIndexTableEntry(const SFOIndexTableEntry& sfo_index_table_entry, size_t i);
   static void PrintSFOTable(const SFOTable& sfo_table);
 #endif
 
-  bool LoadPBPHeader();
-  bool LoadSFOHeader();
-  bool LoadSFOIndexTable();
-  bool LoadSFOTable();
+  bool LoadPBPHeader(Error* error);
+  bool LoadSFOHeader(Error* error);
+  bool LoadSFOIndexTable(Error* error);
+  bool LoadSFOTable(Error* error);
 
   bool IsValidEboot(Error* error);
 
@@ -174,7 +173,7 @@ private:
 
   static const std::string* LookupStringSFOTableEntry(const char* key, const SFOTable& table);
 
-  FILE* m_file = nullptr;
+  std::FILE* m_file = nullptr;
 
   PBPHeader m_pbp_header;
   SFOHeader m_sfo_header;
@@ -195,88 +194,78 @@ private:
   std::vector<u8> m_compressed_block;
 
   z_stream m_inflate_stream;
-
-  CDSubChannelReplacement m_sbi;
 };
 } // namespace
 
 CDImagePBP::~CDImagePBP()
 {
   if (m_file)
-    fclose(m_file);
+    std::fclose(m_file);
 
   inflateEnd(&m_inflate_stream);
 }
 
-bool CDImagePBP::LoadPBPHeader()
+bool CDImagePBP::LoadPBPHeader(Error* error)
 {
-  if (!m_file)
-    return false;
-
-  if (FileSystem::FSeek64(m_file, 0, SEEK_END) != 0)
-    return false;
-
-  if (FileSystem::FTell64(m_file) < 0)
-    return false;
-
-  if (FileSystem::FSeek64(m_file, 0, SEEK_SET) != 0)
-    return false;
-
   if (std::fread(&m_pbp_header, sizeof(PBPHeader), 1, m_file) != 1)
   {
-    Log_ErrorPrint("Unable to read PBP header");
+    Error::SetErrno(error, "fread() for PBP header failed: ", errno);
     return false;
   }
 
-  if (std::strncmp((char*)m_pbp_header.magic, "\0PBP", 4) != 0)
+  if (std::memcmp(m_pbp_header.magic, "\0PBP", 4) != 0)
   {
-    Log_ErrorPrint("PBP magic number mismatch");
+    Error::SetStringView(error, "PBP magic number mismatch");
     return false;
   }
 
-#if _DEBUG
+#if defined(_DEBUG) || defined(_DEVEL)
   PrintPBPHeaderInfo(m_pbp_header);
 #endif
 
   return true;
 }
 
-bool CDImagePBP::LoadSFOHeader()
+bool CDImagePBP::LoadSFOHeader(Error* error)
 {
-  if (FileSystem::FSeek64(m_file, m_pbp_header.param_sfo_offset, SEEK_SET) != 0)
+  if (!FileSystem::FSeek64(m_file, m_pbp_header.param_sfo_offset, SEEK_SET, error))
     return false;
 
   if (std::fread(&m_sfo_header, sizeof(SFOHeader), 1, m_file) != 1)
-    return false;
-
-  if (std::strncmp((char*)m_sfo_header.magic, "\0PSF", 4) != 0)
   {
-    Log_ErrorPrint("SFO magic number mismatch");
+    Error::SetErrno(error, "fread() for SFO header failed: ", errno);
     return false;
   }
 
-#if _DEBUG
+  if (std::memcmp(m_sfo_header.magic, "\0PSF", 4) != 0)
+  {
+    Error::SetStringView(error, "SFO magic number mismatch");
+    return false;
+  }
+
+#if defined(_DEBUG) || defined(_DEVEL)
   PrintSFOHeaderInfo(m_sfo_header);
 #endif
 
   return true;
 }
 
-bool CDImagePBP::LoadSFOIndexTable()
+bool CDImagePBP::LoadSFOIndexTable(Error* error)
 {
   m_sfo_index_table.clear();
   m_sfo_index_table.resize(m_sfo_header.num_table_entries);
 
-  if (FileSystem::FSeek64(m_file, m_pbp_header.param_sfo_offset + sizeof(m_sfo_header), SEEK_SET) != 0)
+  if (!FileSystem::FSeek64(m_file, m_pbp_header.param_sfo_offset + sizeof(m_sfo_header), SEEK_SET, error))
     return false;
 
   if (std::fread(m_sfo_index_table.data(), sizeof(SFOIndexTableEntry), m_sfo_header.num_table_entries, m_file) !=
       m_sfo_header.num_table_entries)
   {
+    Error::SetErrno(error, "fread() for SFO index table failed: ", errno);
     return false;
   }
 
-#if _DEBUG
+#if defined(_DEBUG) || defined(_DEVEL)
   for (size_t i = 0; i < static_cast<size_t>(m_sfo_header.num_table_entries); ++i)
     PrintSFOIndexTableEntry(m_sfo_index_table[i], i);
 #endif
@@ -284,7 +273,7 @@ bool CDImagePBP::LoadSFOIndexTable()
   return true;
 }
 
-bool CDImagePBP::LoadSFOTable()
+bool CDImagePBP::LoadSFOTable(Error* error)
 {
   m_sfo_table.clear();
 
@@ -295,37 +284,39 @@ bool CDImagePBP::LoadSFOTable()
     u32 abs_data_offset =
       m_pbp_header.param_sfo_offset + m_sfo_header.data_table_offset + m_sfo_index_table[i].data_offset;
 
-    if (FileSystem::FSeek64(m_file, abs_key_offset, SEEK_SET) != 0)
+    if (!FileSystem::FSeek64(m_file, abs_key_offset, SEEK_SET, error))
     {
-      Log_ErrorPrintf("Failed seek to key for SFO table entry %zu", i);
+      Error::AddPrefixFmt(error, "Failed seek to key for SFO table entry {}: ", i);
       return false;
     }
 
     // Longest known key string is 20 characters total, including the null character
     char key_cstr[20] = {};
-    if (std::fgets(key_cstr, sizeof(key_cstr), m_file) == nullptr)
+    if (!std::fgets(key_cstr, sizeof(key_cstr), m_file))
     {
-      Log_ErrorPrintf("Failed to read key string for SFO table entry %zu", i);
+      Error::SetErrno(error, "fgets() failed: ", errno);
+      Error::AddPrefixFmt(error, "Failed to read key string for SFO table entry {}: ", i);
       return false;
     }
 
-    if (FileSystem::FSeek64(m_file, abs_data_offset, SEEK_SET) != 0)
+    if (!FileSystem::FSeek64(m_file, abs_data_offset, SEEK_SET, error))
     {
-      Log_ErrorPrintf("Failed seek to data for SFO table entry %zu", i);
+      Error::AddPrefixFmt(error, "Failed seek to data for SFO table entry {}: ", i);
       return false;
     }
 
     if (m_sfo_index_table[i].data_type == 0x0004) // "special mode" UTF-8 (not null terminated)
     {
-      Log_ErrorPrintf("Unhandled special mode UTF-8 type found in SFO table for entry %zu", i);
+      Error::SetStringFmt(error, "Unhandled special mode UTF-8 type found in SFO table for entry {}", i);
       return false;
     }
     else if (m_sfo_index_table[i].data_type == 0x0204) // null-terminated UTF-8 character string
     {
       std::vector<char> data_cstr(m_sfo_index_table[i].data_size);
-      if (fgets(data_cstr.data(), static_cast<int>(data_cstr.size() * sizeof(char)), m_file) == nullptr)
+      if (!std::fgets(data_cstr.data(), static_cast<int>(data_cstr.size() * sizeof(char)), m_file))
       {
-        Log_ErrorPrintf("Failed to read data string for SFO table entry %zu", i);
+        Error::SetErrno(error, "fgets() failed: ", errno);
+        Error::AddPrefixFmt(error, "Failed to read data string for SFO table entry {}: ", i);
         return false;
       }
 
@@ -334,9 +325,10 @@ bool CDImagePBP::LoadSFOTable()
     else if (m_sfo_index_table[i].data_type == 0x0404) // uint32_t
     {
       u32 val;
-      if (fread(&val, sizeof(u32), 1, m_file) != 1)
+      if (std::fread(&val, sizeof(u32), 1, m_file) != 1)
       {
-        Log_ErrorPrintf("Failed to read unsigned data value for SFO table entry %zu", i);
+        Error::SetErrno(error, "fread() failed: ", errno);
+        Error::AddPrefixFmt(error, "Failed to read unsigned data value for SFO table entry {}: ", i);
         return false;
       }
 
@@ -344,13 +336,13 @@ bool CDImagePBP::LoadSFOTable()
     }
     else
     {
-      Log_ErrorPrintf("Unhandled SFO data type 0x%04X found in SFO table for entry %zu", m_sfo_index_table[i].data_type,
-                      i);
+      Error::SetStringFmt(error, "Unhandled SFO data type 0x{:04X} found in SFO table for entry {}",
+                          m_sfo_index_table[i].data_type, i);
       return false;
     }
   }
 
-#if _DEBUG
+#if defined(_DEBUG) || defined(_DEVEL)
   PrintSFOTable(m_sfo_table);
 #endif
 
@@ -367,14 +359,14 @@ bool CDImagePBP::IsValidEboot(Error* error)
     SFOTableDataValue data_value = a_it->second;
     if (!std::holds_alternative<u32>(data_value) || std::get<u32>(data_value) != 1)
     {
-      Log_ErrorPrint("Invalid BOOTABLE value");
+      ERROR_LOG("Invalid BOOTABLE value");
       Error::SetString(error, "Invalid BOOTABLE value");
       return false;
     }
   }
   else
   {
-    Log_ErrorPrint("No BOOTABLE value found");
+    ERROR_LOG("No BOOTABLE value found");
     Error::SetString(error, "No BOOTABLE value found");
     return false;
   }
@@ -385,14 +377,14 @@ bool CDImagePBP::IsValidEboot(Error* error)
     SFOTableDataValue data_value = a_it->second;
     if (!std::holds_alternative<std::string>(data_value) || std::get<std::string>(data_value) != "ME")
     {
-      Log_ErrorPrint("Invalid CATEGORY value");
+      ERROR_LOG("Invalid CATEGORY value");
       Error::SetString(error, "Invalid CATEGORY value");
       return false;
     }
   }
   else
   {
-    Log_ErrorPrint("No CATEGORY value found");
+    ERROR_LOG("No CATEGORY value found");
     Error::SetString(error, "No CATEGORY value found");
     return false;
   }
@@ -402,82 +394,76 @@ bool CDImagePBP::IsValidEboot(Error* error)
 
 bool CDImagePBP::Open(const char* filename, Error* error)
 {
-  m_file = FileSystem::OpenCFile(filename, "rb");
+  m_file = FileSystem::OpenSharedCFile(filename, "rb", FileSystem::FileShareMode::DenyWrite, error);
   if (!m_file)
   {
-    if (error)
-      error->SetErrno(errno);
-
+    Error::AddPrefixFmt(error, "Failed to open '{}': ", Path::GetFileName(filename));
     return false;
   }
 
   m_filename = filename;
 
   // Read in PBP header
-  if (!LoadPBPHeader())
-  {
-    Log_ErrorPrint("Failed to load PBP header");
-    Error::SetString(error, "Failed to load PBP header");
+  if (!LoadPBPHeader(error))
     return false;
-  }
 
   // Read in SFO header
-  if (!LoadSFOHeader())
-  {
-    Log_ErrorPrint("Failed to load SFO header");
-    Error::SetString(error, "Failed to load SFO header");
+  if (!LoadSFOHeader(error))
     return false;
-  }
 
   // Read in SFO index table
-  if (!LoadSFOIndexTable())
-  {
-    Log_ErrorPrint("Failed to load SFO index table");
-    Error::SetString(error, "Failed to load SFO index table");
+  if (!LoadSFOIndexTable(error))
     return false;
-  }
 
   // Read in SFO table
-  if (!LoadSFOTable())
-  {
-    Log_ErrorPrint("Failed to load SFO table");
-    Error::SetString(error, "Failed to load SFO table");
+  if (!LoadSFOTable(error))
     return false;
-  }
 
   // Since PBP files can store things that aren't PS1 CD images, make sure we're loading the right kind
   if (!IsValidEboot(error))
   {
-    Log_ErrorPrint("Couldn't validate EBOOT");
+    ERROR_LOG("Couldn't validate EBOOT");
     return false;
   }
 
   // Start parsing ISO stuff
-  if (FileSystem::FSeek64(m_file, m_pbp_header.data_psar_offset, SEEK_SET) != 0)
+  if (!FileSystem::FSeek64(m_file, m_pbp_header.data_psar_offset, SEEK_SET, error))
+  {
+    Error::AddPrefix(error, "Failed to seek to psar offset: ");
     return false;
+  }
 
   // Check "PSTITLEIMG000000" for multi-disc
   char data_psar_magic[16] = {};
   if (std::fread(data_psar_magic, sizeof(data_psar_magic), 1, m_file) != 1)
+  {
+    Error::SetErrno(error, "Failed to read data_psar_magic: ", errno);
     return false;
+  }
 
-  if (std::strncmp(data_psar_magic, "PSTITLEIMG000000", 16) == 0) // Multi-disc header found
+  if (std::memcmp(data_psar_magic, "PSTITLEIMG000000", 16) == 0) // Multi-disc header found
   {
     // For multi-disc, the five disc offsets are located at data_psar_offset + 0x200. Non-present discs have an offset
     // of 0. There are also some disc hashes, a serial (from one of the discs, but used as an identifier for the entire
     // "title image" header), and some other offsets, but we don't really need to check those
 
-    if (FileSystem::FSeek64(m_file, m_pbp_header.data_psar_offset + 0x200, SEEK_SET) != 0)
+    if (!FileSystem::FSeek64(m_file, m_pbp_header.data_psar_offset + 0x200, SEEK_SET, error))
+    {
+      Error::AddPrefix(error, "Failed to seek to multi-disc header: ");
       return false;
+    }
 
     u32 disc_table[DISC_TABLE_NUM_ENTRIES] = {};
     if (std::fread(disc_table, sizeof(u32), DISC_TABLE_NUM_ENTRIES, m_file) != DISC_TABLE_NUM_ENTRIES)
+    {
+      Error::SetErrno(error, "Failed to read disc_table", errno);
       return false;
+    }
 
     // Ignore encrypted files
     if (disc_table[0] == 0x44475000) // "\0PGD"
     {
-      Log_ErrorPrintf("Encrypted PBP images are not supported, skipping %s", m_filename.c_str());
+      ERROR_LOG("Encrypted PBP images are not supported, skipping {}", m_filename);
       Error::SetString(error, "Encrypted PBP images are not supported");
       return false;
     }
@@ -493,7 +479,7 @@ bool CDImagePBP::Open(const char* filename, Error* error)
 
     if (m_disc_offsets.size() < 1)
     {
-      Log_ErrorPrintf("Invalid number of discs (%u) in multi-disc PBP file", static_cast<u32>(m_disc_offsets.size()));
+      Error::SetStringFmt(error, "Invalid number of discs ({}) in multi-disc PBP file", m_disc_offsets.size());
       return false;
     }
   }
@@ -510,8 +496,8 @@ bool CDImagePBP::OpenDisc(u32 index, Error* error)
 {
   if (index >= m_disc_offsets.size())
   {
-    Log_ErrorPrintf("File does not contain disc %u", index + 1);
-    Error::SetString(error, fmt::format("File does not contain disc {}", index + 1));
+    ERROR_LOG("File does not contain disc {}", index + 1);
+    Error::SetStringFmt(error, "File does not contain disc {}", index + 1);
     return false;
   }
 
@@ -532,7 +518,7 @@ bool CDImagePBP::OpenDisc(u32 index, Error* error)
 
   if (std::strncmp(iso_header_magic, "PSISOIMG0000", 12) != 0)
   {
-    Log_ErrorPrint("ISO header magic number mismatch");
+    ERROR_LOG("ISO header magic number mismatch");
     return false;
   }
 
@@ -546,7 +532,7 @@ bool CDImagePBP::OpenDisc(u32 index, Error* error)
 
   if (pgd_magic == 0x44475000) // "\0PGD"
   {
-    Log_ErrorPrintf("Encrypted PBP images are not supported, skipping %s", m_filename.c_str());
+    ERROR_LOG("Encrypted PBP images are not supported, skipping {}", m_filename);
     Error::SetString(error, "Encrypted PBP images are not supported");
     return false;
   }
@@ -595,7 +581,7 @@ bool CDImagePBP::OpenDisc(u32 index, Error* error)
   // valid. Not sure what m_toc[0].userdata_start.s encodes on homebrew EBOOTs though, so ignore that
   if (m_toc[0].point != 0xA0 || m_toc[1].point != 0xA1 || m_toc[2].point != 0xA2)
   {
-    Log_ErrorPrint("Invalid points on information tracks");
+    ERROR_LOG("Invalid points on information tracks");
     return false;
   }
 
@@ -606,7 +592,7 @@ bool CDImagePBP::OpenDisc(u32 index, Error* error)
 
   if (first_track != 1 || last_track < first_track)
   {
-    Log_ErrorPrint("Invalid starting track number or track count");
+    ERROR_LOG("Invalid starting track number or track count");
     return false;
   }
 
@@ -624,7 +610,7 @@ bool CDImagePBP::OpenDisc(u32 index, Error* error)
     const TOCEntry& t = m_toc[static_cast<size_t>(curr_track) + 2];
     const u8 track_num = PackedBCDToBinary(t.point);
     if (track_num != curr_track)
-      Log_WarningPrintf("Mismatched TOC track number, expected %u but got %u", static_cast<u32>(curr_track), track_num);
+      WARNING_LOG("Mismatched TOC track number, expected {} but got {}", curr_track, track_num);
 
     const bool is_audio_track = t.type == 0x01;
     const bool is_first_track = curr_track == 1;
@@ -644,14 +630,14 @@ bool CDImagePBP::OpenDisc(u32 index, Error* error)
     {
       if (!is_first_track || is_audio_track)
       {
-        Log_ErrorPrintf("Invalid TOC entry at index %u, user data (%u) should not start before pregap (%u)",
-                        static_cast<u32>(curr_track), userdata_start, pregap_start);
+        ERROR_LOG("Invalid TOC entry at index {}, user data ({}) should not start before pregap ({})", curr_track,
+                  userdata_start, pregap_start);
         return false;
       }
 
-      Log_WarningPrintf(
-        "Invalid TOC entry at index %u, user data (%u) should not start before pregap (%u), assuming not in file.",
-        static_cast<u32>(curr_track), userdata_start, pregap_start);
+      WARNING_LOG(
+        "Invalid TOC entry at index {}, user data ({}) should not start before pregap ({}), assuming not in file.",
+        curr_track, userdata_start, pregap_start);
       pregap_start = 0;
       pregap_frames = userdata_start;
       pregap_sector_size = 0;
@@ -660,13 +646,13 @@ bool CDImagePBP::OpenDisc(u32 index, Error* error)
     {
       pregap_frames = userdata_start - pregap_start;
       pregap_sector_size = track_sector_size;
+
+      if (is_first_track)
+        m_lba_count += pregap_frames;
     }
 
     if (is_first_track)
-    {
-      m_lba_count += pregap_frames;
       track1_pregap_frames = pregap_frames;
-    }
 
     Index pregap_index = {};
     pregap_index.file_offset =
@@ -702,8 +688,7 @@ bool CDImagePBP::OpenDisc(u32 index, Error* error)
     {
       if (userdata_start >= m_lba_count)
       {
-        Log_ErrorPrintf("Last user data index on disc for TOC entry %u should not be 0 or less in length",
-                        static_cast<u32>(curr_track));
+        ERROR_LOG("Last user data index on disc for TOC entry {} should not be 0 or less in length", curr_track);
         return false;
       }
       userdata_index.length = m_lba_count - userdata_start;
@@ -717,7 +702,7 @@ bool CDImagePBP::OpenDisc(u32 index, Error* error)
 
       if (next_track_num != curr_track + 1 || next_track_start < userdata_start)
       {
-        Log_ErrorPrintf("Unable to calculate user data index length for TOC entry %u", static_cast<u32>(curr_track));
+        ERROR_LOG("Unable to calculate user data index length for TOC entry {}", curr_track);
         return false;
       }
 
@@ -736,18 +721,8 @@ bool CDImagePBP::OpenDisc(u32 index, Error* error)
   // Initialize zlib stream
   if (!InitDecompressionStream())
   {
-    Log_ErrorPrint("Failed to initialize zlib decompression stream");
+    ERROR_LOG("Failed to initialize zlib decompression stream");
     return false;
-  }
-
-  if (m_disc_offsets.size() > 1)
-  {
-    const std::string offset_path = fmt::format("{}_{}.pbp", Path::StripExtension(m_filename), index + 1);
-    m_sbi.LoadFromImagePath(offset_path);
-  }
-  else
-  {
-    m_sbi.LoadFromImagePath(Path::ReplaceExtension(m_filename, "sbi"));
   }
 
   m_current_disc = index;
@@ -806,26 +781,13 @@ bool CDImagePBP::DecompressBlock(const BlockInfo& block_info)
     return false;
 
   int err = inflate(&m_inflate_stream, Z_FINISH);
-  if (err != Z_STREAM_END)
+  if (err != Z_STREAM_END) [[unlikely]]
   {
-    Log_ErrorPrintf("Inflate error %d", err);
+    ERROR_LOG("Inflate error {}", err);
     return false;
   }
 
   return true;
-}
-
-bool CDImagePBP::ReadSubChannelQ(SubChannelQ* subq, const Index& index, LBA lba_in_index)
-{
-  if (m_sbi.GetReplacementSubChannelQ(index.start_lba_on_disc + lba_in_index, subq))
-    return true;
-
-  return CDImage::ReadSubChannelQ(subq, index, lba_in_index);
-}
-
-bool CDImagePBP::HasNonStandardSubchannel() const
-{
-  return (m_sbi.GetReplacementSectorCount() > 0);
 }
 
 bool CDImagePBP::ReadSectorFromIndex(void* buffer, const Index& index, LBA lba_in_index)
@@ -834,17 +796,22 @@ bool CDImagePBP::ReadSectorFromIndex(void* buffer, const Index& index, LBA lba_i
   const u32 offset_in_block = offset_in_file % DECOMPRESSED_BLOCK_SIZE;
   const u32 requested_block = offset_in_file / DECOMPRESSED_BLOCK_SIZE;
 
-  BlockInfo& bi = m_blockinfo_table[requested_block];
-
-  if (bi.size == 0)
+  if (requested_block >= m_blockinfo_table.size()) [[unlikely]]
   {
-    Log_ErrorPrintf("Invalid block %u requested", requested_block);
+    ERROR_LOG("Invalid block {} requested", requested_block);
     return false;
   }
 
-  if (m_current_block != requested_block && !DecompressBlock(bi))
+  const BlockInfo& bi = m_blockinfo_table[requested_block];
+  if (bi.size == 0) [[unlikely]]
   {
-    Log_ErrorPrintf("Failed to decompress block %u", requested_block);
+    ERROR_LOG("Requested block {} has size 0", requested_block);
+    return false;
+  }
+
+  if (m_current_block != requested_block && !DecompressBlock(bi)) [[unlikely]]
+  {
+    ERROR_LOG("Failed to decompress block {}", requested_block);
     return false;
   }
 
@@ -852,7 +819,7 @@ bool CDImagePBP::ReadSectorFromIndex(void* buffer, const Index& index, LBA lba_i
   return true;
 }
 
-#if _DEBUG
+#if defined(_DEBUG) || defined(_DEVEL)
 void CDImagePBP::PrintPBPHeaderInfo(const PBPHeader& pbp_header)
 {
   printf("PBP header info\n");
@@ -910,18 +877,6 @@ bool CDImagePBP::HasSubImages() const
   return m_disc_offsets.size() > 1;
 }
 
-std::string CDImagePBP::GetMetadata(const std::string_view& type) const
-{
-  if (type == "title")
-  {
-    const std::string* title = LookupStringSFOTableEntry("TITLE", m_sfo_table);
-    if (title && !title->empty())
-      return *title;
-  }
-
-  return CDImage::GetMetadata(type);
-}
-
 u32 CDImagePBP::GetSubImageCount() const
 {
   return static_cast<u32>(m_disc_offsets.size());
@@ -943,27 +898,33 @@ bool CDImagePBP::SwitchSubImage(u32 index, Error* error)
     // return to old disc, this should never fail... in theory.
     if (!OpenDisc(old_disc, nullptr))
       Panic("Failed to reopen old disc after switch.");
+
+    return false;
   }
 
   return true;
 }
 
-std::string CDImagePBP::GetSubImageMetadata(u32 index, const std::string_view& type) const
+std::string CDImagePBP::GetSubImageTitle(u32 index) const
 {
-  if (type == "title")
-  {
-    const std::string* title = LookupStringSFOTableEntry("TITLE", m_sfo_table);
-    if (title && !title->empty())
-      return fmt::format("{} (Disc {})", *title, index + 1);
-  }
+  std::string ret;
 
-  return CDImage::GetSubImageMetadata(index, type);
+  const std::string* title = LookupStringSFOTableEntry("TITLE", m_sfo_table);
+  if (title && !title->empty())
+    ret = fmt::format("{} (Disc {})", *title, index + 1);
+
+  return ret;
 }
 
-std::unique_ptr<CDImage> CDImage::OpenPBPImage(const char* filename, Error* error)
+s64 CDImagePBP::GetSizeOnDisk() const
+{
+  return FileSystem::FSize64(m_file);
+}
+
+std::unique_ptr<CDImage> CDImage::OpenPBPImage(const char* path, Error* error)
 {
   std::unique_ptr<CDImagePBP> image = std::make_unique<CDImagePBP>();
-  if (!image->Open(filename, error))
+  if (!image->Open(path, error))
     return {};
 
   return image;

@@ -1,6 +1,6 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <Import Project="..\msvc\vsprops\Configurations.props" />
+  <Import Project="..\vsprops\Configurations.props" />
   <ItemGroup>
     <ClInclude Include="include\cubeb\cubeb.h" />
     <ClInclude Include="include\cubeb\cubeb_export.h" />
@@ -22,7 +22,6 @@
     <ClInclude Include="subprojects\speex\resample_sse.h" />
     <ClInclude Include="subprojects\speex\speex_config_types.h" />
     <ClInclude Include="subprojects\speex\speex_resampler.h" />
-    <ClInclude Include="subprojects\speex\stack_alloc.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\cubeb.c" />
@@ -40,7 +39,7 @@
   <PropertyGroup Label="Globals">
     <ProjectGuid>{72F9423C-91EE-4487-AAC6-555ED6F61AA1}</ProjectGuid>
   </PropertyGroup>
-  <Import Project="..\msvc\vsprops\StaticLibrary.props" />
+  <Import Project="..\vsprops\StaticLibrary.props" />
   <ItemDefinitionGroup>
     <ClCompile>
       <WarningLevel>TurnOffAllWarnings</WarningLevel>
@@ -55,5 +54,5 @@
       <AdditionalDependencies Condition="'$(Platform)'!='ARM64'">ksuser.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Lib>
   </ItemDefinitionGroup>
-  <Import Project="..\msvc\vsprops\Targets.props" />
+  <Import Project="..\vsprops\Targets.props" />
 </Project>

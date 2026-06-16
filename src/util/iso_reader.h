@@ -1,18 +1,21 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 
 #include "common/types.h"
 
+#include <cstdio>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
 class CDImage;
 
 class Error;
+class ProgressCallback;
 
 class IsoReader
 {
@@ -104,6 +107,8 @@ public:
     u8 minute;
     u8 second;
     s8 gmt_offset;
+
+    std::string GetFormattedTime() const;
   };
 
   enum ISODirectoryEntryFlags : u8
@@ -138,10 +143,20 @@ public:
 
 #pragma pack(pop)
 
+  enum class ReadMode : u8
+  {
+    Data,
+    Mode2,
+    Raw,
+  };
+
   IsoReader();
   ~IsoReader();
 
-  static std::string_view RemoveVersionIdentifierFromPath(const std::string_view& path);
+  static std::string_view RemoveVersionIdentifierFromPath(std::string_view path);
+
+  static u32 GetReadModeSectorSize(ReadMode mode);
+  static std::span<const u8> ExtractSectorData(std::span<const u8> raw_sector, ReadMode mode, Error* error);
 
   ALWAYS_INLINE const CDImage* GetImage() const { return m_image; }
   ALWAYS_INLINE u32 GetTrackNumber() const { return m_track_number; }
@@ -150,25 +165,30 @@ public:
 
   bool Open(CDImage* image, u32 track_number, Error* error = nullptr);
 
-  std::vector<std::string> GetFilesInDirectory(const std::string_view& path, Error* error = nullptr);
-  std::vector<std::pair<std::string, ISODirectoryEntry>> GetEntriesInDirectory(const std::string_view& path,
+  std::vector<std::string> GetFilesInDirectory(std::string_view path, Error* error = nullptr);
+  std::vector<std::pair<std::string, ISODirectoryEntry>> GetEntriesInDirectory(std::string_view path,
                                                                                Error* error = nullptr);
 
-  std::optional<ISODirectoryEntry> LocateFile(const std::string_view& path, Error* error);
+  std::optional<ISODirectoryEntry> LocateFile(std::string_view path, Error* error);
 
-  bool FileExists(const std::string_view& path, Error* error = nullptr);
-  bool DirectoryExists(const std::string_view& path, Error* error = nullptr);
-  bool ReadFile(const std::string_view& path, std::vector<u8>* data, Error* error = nullptr);
-  bool ReadFile(const ISODirectoryEntry& de, std::vector<u8>* data, Error* error = nullptr);
+  bool FileExists(std::string_view path, Error* error = nullptr);
+  bool DirectoryExists(std::string_view path, Error* error = nullptr);
+  bool ReadFile(std::string_view path, std::vector<u8>* data, ReadMode read_mode, Error* error = nullptr);
+  bool ReadFile(const ISODirectoryEntry& de, std::vector<u8>* data, ReadMode read_mode, Error* error = nullptr);
+
+  bool WriteFileToStream(std::string_view path, std::FILE* fp, ReadMode read_mode, Error* error = nullptr,
+                         ProgressCallback* progress = nullptr);
+  bool WriteFileToStream(const ISODirectoryEntry& de, std::FILE* fp, ReadMode read_mode, Error* error = nullptr,
+                         ProgressCallback* progress = nullptr);
 
 private:
-  static std::string_view GetDirectoryEntryFileName(const u8* sector, u32 de_sector_offset);
+  static std::string_view GetDirectoryEntryFileName(std::span<const u8, SECTOR_SIZE> sector, u32 de_sector_offset);
 
-  bool ReadSector(u8* buf, u32 lsn, Error* error);
+  bool ReadSector(std::span<u8, SECTOR_SIZE> buf, u32 lsn, Error* error);
   bool ReadPVD(Error* error);
 
-  std::optional<ISODirectoryEntry> LocateFile(const std::string_view& path, u8* sector_buffer, u32 directory_record_lba,
-                                              u32 directory_record_size, Error* error);
+  std::optional<ISODirectoryEntry> LocateFile(std::string_view path, std::span<u8, SECTOR_SIZE> sector_buffer,
+                                              u32 directory_record_lba, u32 directory_record_size, Error* error);
 
   CDImage* m_image;
   u32 m_track_number;

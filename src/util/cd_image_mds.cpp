@@ -1,10 +1,10 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "assert.h"
 #include "cd_image.h"
-#include "cd_subchannel_replacement.h"
 
+#include "common/bcdutils.h"
 #include "common/error.h"
 #include "common/file_system.h"
 #include "common/log.h"
@@ -14,7 +14,7 @@
 #include <cerrno>
 #include <map>
 
-Log_SetChannel(CDImageMds);
+LOG_CHANNEL(CDImage);
 
 namespace {
 
@@ -38,16 +38,15 @@ struct TrackEntry
 static_assert(sizeof(TrackEntry) == 0x50, "TrackEntry is 0x50 bytes");
 #pragma pack(pop)
 
-class CDImageMds : public CDImage
+class CDImageMDS : public CDImage
 {
 public:
-  CDImageMds();
-  ~CDImageMds() override;
+  CDImageMDS();
+  ~CDImageMDS() override;
 
   bool OpenAndParse(const char* filename, Error* error);
 
-  bool ReadSubChannelQ(SubChannelQ* subq, const Index& index, LBA lba_in_index) override;
-  bool HasNonStandardSubchannel() const override;
+  s64 GetSizeOnDisk() const override;
 
 protected:
   bool ReadSectorFromIndex(void* buffer, const Index& index, LBA lba_in_index) override;
@@ -55,51 +54,50 @@ protected:
 private:
   std::FILE* m_mdf_file = nullptr;
   u64 m_mdf_file_position = 0;
-  CDSubChannelReplacement m_sbi;
 };
 
 } // namespace
 
-CDImageMds::CDImageMds() = default;
+CDImageMDS::CDImageMDS() = default;
 
-CDImageMds::~CDImageMds()
+CDImageMDS::~CDImageMDS()
 {
   if (m_mdf_file)
     std::fclose(m_mdf_file);
 }
 
-bool CDImageMds::OpenAndParse(const char* filename, Error* error)
+bool CDImageMDS::OpenAndParse(const char* filename, Error* error)
 {
-  std::FILE* mds_fp = FileSystem::OpenCFile(filename, "rb", error);
+  std::FILE* mds_fp = FileSystem::OpenSharedCFile(filename, "rb", FileSystem::FileShareMode::DenyWrite, error);
   if (!mds_fp)
   {
-    Log_ErrorPrintf("Failed to open mds '%s': errno %d", filename, errno);
+    Error::AddPrefixFmt(error, "Failed to open mds '{}': ", Path::GetFileName(filename));
     return false;
   }
 
-  std::optional<std::vector<u8>> mds_data_opt(FileSystem::ReadBinaryFile(mds_fp));
+  std::optional<DynamicHeapArray<u8>> mds_data_opt(FileSystem::ReadBinaryFile(mds_fp));
   std::fclose(mds_fp);
   if (!mds_data_opt.has_value() || mds_data_opt->size() < 0x54)
   {
-    Log_ErrorPrintf("Failed to read mds file '%s'", filename);
-    Error::SetString(error, fmt::format("Failed to read mds file '{}'", filename));
+    ERROR_LOG("Failed to read mds file '{}'", Path::GetFileName(filename));
+    Error::SetStringFmt(error, "Failed to read mds file '{}'", filename);
     return false;
   }
 
   std::string mdf_filename(Path::ReplaceExtension(filename, "mdf"));
-  m_mdf_file = FileSystem::OpenCFile(mdf_filename.c_str(), "rb", error);
+  m_mdf_file = FileSystem::OpenSharedCFile(mdf_filename.c_str(), "rb", FileSystem::FileShareMode::DenyWrite, error);
   if (!m_mdf_file)
   {
-    Log_ErrorPrintf("Failed to open mdf file '%s': errno %d", mdf_filename.c_str(), errno);
+    Error::AddPrefixFmt(error, "Failed to open mdf file '{}': ", Path::GetFileName(mdf_filename));
     return false;
   }
 
-  const std::vector<u8>& mds = mds_data_opt.value();
+  const DynamicHeapArray<u8>& mds = mds_data_opt.value();
   static constexpr char expected_signature[] = "MEDIA DESCRIPTOR";
   if (std::memcmp(&mds[0], expected_signature, sizeof(expected_signature) - 1) != 0)
   {
-    Log_ErrorPrintf("Incorrect signature in '%s'", filename);
-    Error::SetString(error, fmt::format("Incorrect signature in '{}'", filename));
+    ERROR_LOG("Incorrect signature in '{}'", Path::GetFileName(filename));
+    Error::SetStringFmt(error, "Incorrect signature in '{}'", Path::GetFileName(filename));
     return false;
   }
 
@@ -107,8 +105,8 @@ bool CDImageMds::OpenAndParse(const char* filename, Error* error)
   std::memcpy(&session_offset, &mds[0x50], sizeof(session_offset));
   if ((session_offset + 24) > mds.size())
   {
-    Log_ErrorPrintf("Invalid session offset in '%s'", filename);
-    Error::SetString(error, fmt::format("Invalid session offset in '{}'", filename));
+    ERROR_LOG("Invalid session offset in '{}'", Path::GetFileName(filename));
+    Error::SetStringFmt(error, "Invalid session offset in '{}'", Path::GetFileName(filename));
     return false;
   }
 
@@ -118,9 +116,9 @@ bool CDImageMds::OpenAndParse(const char* filename, Error* error)
   std::memcpy(&track_offset, &mds[session_offset + 20], sizeof(track_offset));
   if (track_count > 99 || track_offset >= mds.size())
   {
-    Log_ErrorPrintf("Invalid track count/block offset %u/%u in '%s'", track_count, track_offset, filename);
-    Error::SetString(
-      error, fmt::format("Invalid track count/block offset {}/{} in '{}'", track_count, track_offset, filename));
+    ERROR_LOG("Invalid track count/block offset {}/{} in '{}'", track_count, track_offset, Path::GetFileName(filename));
+    Error::SetStringFmt(error, "Invalid track count/block offset {}/{} in '{}'", track_count, track_offset,
+                        Path::GetFileName(filename));
     return false;
   }
 
@@ -138,8 +136,8 @@ bool CDImageMds::OpenAndParse(const char* filename, Error* error)
   {
     if ((track_offset + sizeof(TrackEntry)) > mds.size())
     {
-      Log_ErrorPrintf("End of file in '%s' at track %u", filename, track_number);
-      Error::SetString(error, fmt::format("End of file in '{}' at track {}", filename, track_number));
+      ERROR_LOG("End of file in '{}' at track {}", Path::GetFileName(filename), track_number);
+      Error::SetStringFmt(error, "End of file in '{}' at track {}", Path::GetFileName(filename), track_number);
       return false;
     }
 
@@ -149,9 +147,8 @@ bool CDImageMds::OpenAndParse(const char* filename, Error* error)
 
     if (PackedBCDToBinary(track.track_number) != track_number)
     {
-      Log_ErrorPrintf("Unexpected track number 0x%02X in track %u", track.track_number, track_number);
-      Error::SetString(error,
-                       fmt::format("Unexpected track number 0x{:02X} in track {}", track.track_number, track_number));
+      ERROR_LOG("Unexpected track number 0x{:02X} in track {}", track.track_number, track_number);
+      Error::SetStringFmt(error, "Unexpected track number 0x{:02X} in track {}", track.track_number, track_number);
       return false;
     }
 
@@ -161,8 +158,8 @@ bool CDImageMds::OpenAndParse(const char* filename, Error* error)
 
     if ((track.extra_offset + sizeof(u32) + sizeof(u32)) > mds.size())
     {
-      Log_ErrorPrintf("Invalid extra offset %u in track %u", track.extra_offset, track_number);
-      Error::SetString(error, fmt::format("Invalid extra offset {} in track {}", track.extra_offset, track_number));
+      ERROR_LOG("Invalid extra offset {} in track {}", track.extra_offset, track_number);
+      Error::SetStringFmt(error, "Invalid extra offset {} in track {}", track.extra_offset, track_number);
       return false;
     }
 
@@ -184,9 +181,8 @@ bool CDImageMds::OpenAndParse(const char* filename, Error* error)
     {
       if (track_pregap > track_start_lba)
       {
-        Log_ErrorPrintf("Track pregap %u is too large for start lba %u", track_pregap, track_start_lba);
-        Error::SetString(error,
-                         fmt::format("Track pregap {} is too large for start lba {}", track_pregap, track_start_lba));
+        ERROR_LOG("Track pregap {} is too large for start lba {}", track_pregap, track_start_lba);
+        Error::SetStringFmt(error, "Track pregap {} is too large for start lba {}", track_pregap, track_start_lba);
         return false;
       }
 
@@ -236,38 +232,23 @@ bool CDImageMds::OpenAndParse(const char* filename, Error* error)
 
   if (m_tracks.empty())
   {
-    Log_ErrorPrintf("File '%s' contains no tracks", filename);
-    Error::SetString(error, fmt::format("File '{}' contains no tracks", filename));
+    ERROR_LOG("File '{}' contains no tracks", Path::GetFileName(filename));
+    Error::SetStringFmt(error, "File '{}' contains no tracks", Path::GetFileName(filename));
     return false;
   }
 
   m_lba_count = m_tracks.back().start_lba + m_tracks.back().length;
   AddLeadOutIndex();
 
-  m_sbi.LoadFromImagePath(filename);
-
   return Seek(1, Position{0, 0, 0});
 }
 
-bool CDImageMds::ReadSubChannelQ(SubChannelQ* subq, const Index& index, LBA lba_in_index)
-{
-  if (m_sbi.GetReplacementSubChannelQ(index.start_lba_on_disc + lba_in_index, subq))
-    return true;
-
-  return CDImage::ReadSubChannelQ(subq, index, lba_in_index);
-}
-
-bool CDImageMds::HasNonStandardSubchannel() const
-{
-  return (m_sbi.GetReplacementSectorCount() > 0);
-}
-
-bool CDImageMds::ReadSectorFromIndex(void* buffer, const Index& index, LBA lba_in_index)
+bool CDImageMDS::ReadSectorFromIndex(void* buffer, const Index& index, LBA lba_in_index)
 {
   const u64 file_position = index.file_offset + (static_cast<u64>(lba_in_index) * index.file_sector_size);
   if (m_mdf_file_position != file_position)
   {
-    if (std::fseek(m_mdf_file, static_cast<long>(file_position), SEEK_SET) != 0)
+    if (FileSystem::FSeek64(m_mdf_file, file_position, SEEK_SET) != 0)
       return false;
 
     m_mdf_file_position = file_position;
@@ -277,7 +258,7 @@ bool CDImageMds::ReadSectorFromIndex(void* buffer, const Index& index, LBA lba_i
   const u32 read_size = RAW_SECTOR_SIZE;
   if (std::fread(buffer, read_size, 1, m_mdf_file) != 1)
   {
-    std::fseek(m_mdf_file, static_cast<long>(m_mdf_file_position), SEEK_SET);
+    FileSystem::FSeek64(m_mdf_file, m_mdf_file_position, SEEK_SET);
     return false;
   }
 
@@ -285,10 +266,15 @@ bool CDImageMds::ReadSectorFromIndex(void* buffer, const Index& index, LBA lba_i
   return true;
 }
 
-std::unique_ptr<CDImage> CDImage::OpenMdsImage(const char* filename, Error* error)
+s64 CDImageMDS::GetSizeOnDisk() const
 {
-  std::unique_ptr<CDImageMds> image = std::make_unique<CDImageMds>();
-  if (!image->OpenAndParse(filename, error))
+  return FileSystem::FSize64(m_mdf_file);
+}
+
+std::unique_ptr<CDImage> CDImage::OpenMdsImage(const char* path, Error* error)
+{
+  std::unique_ptr<CDImageMDS> image = std::make_unique<CDImageMDS>();
+  if (!image->OpenAndParse(path, error))
     return {};
 
   return image;

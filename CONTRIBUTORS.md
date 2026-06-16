@@ -16,7 +16,8 @@ The following people have contributed to the project in some way, and are credit
 - posix - @Richard-L, blexx - German
 - @phoe-nix, @zkdpower - Chinese (Simplified)
 - Sorer - @MojoJojoDojo - Hebrew
-- Hipnosis - @Hipnosis183, MrHomunculus, @falsepopsky - Spanish
+- @Hipnosis183, @falsepopsky - Spanish (Latin America)
+- @IlDucci - Spanish (Spain)
 - @RaydenX93 - Italian
 - @r57zone - Russian
 - @6lackmag3 - Russian (Android)
@@ -25,6 +26,7 @@ The following people have contributed to the project in some way, and are credit
 - mikakunin - Japanese
 - Zuzia, Seba, @CookiePLMonster - Polish
 - Foxtrot Uniform - Turkish
+- bilginGamer - Azerbaijani
 
 ## UI Contributions
 
@@ -79,6 +81,7 @@ The following people have contributed to the project in some way, and are credit
 - @Overload86
 - @landcaster
 - @Sekai9
+- @Pesa
 
 ## Special Thanks
 

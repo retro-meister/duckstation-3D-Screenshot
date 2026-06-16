@@ -1,9 +1,9 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 
-#include "common/progress_callback.h"
+#include "updater_progress_callback.h"
 
 #include <AppKit/AppKit.h>
 #include <Cocoa/Cocoa.h>
@@ -16,30 +16,26 @@
 #error ARC should not be enabled.
 #endif
 
-class CocoaProgressCallback final : public BaseProgressCallback
+class CocoaProgressCallback final : public UpdaterProgressCallback
 {
 public:
   CocoaProgressCallback();
   ~CocoaProgressCallback();
 
-  void PushState() override;
-  void PopState() override;
+  void SetTitle(const std::string_view title) override;
 
-  void SetCancellable(bool cancellable) override;
-  void SetTitle(const char* title) override;
-  void SetStatusText(const char* text) override;
-  void SetProgressRange(u32 range) override;
-  void SetProgressValue(u32 value) override;
+  void DisplayError(const std::string_view message) override;
+  void DisplayWarning(const std::string_view message) override;
+  void DisplayInformation(const std::string_view message) override;
+  void DisplayDebugMessage(const std::string_view message) override;
 
-  void DisplayError(const char* message) override;
-  void DisplayWarning(const char* message) override;
-  void DisplayInformation(const char* message) override;
-  void DisplayDebugMessage(const char* message) override;
+  void ModalError(const std::string_view message) override;
+  bool ModalConfirmation(const std::string_view message) override;
+  void ModalInformation(const std::string_view message) override;
 
-  void ModalError(const char* message) override;
-  bool ModalConfirmation(const char* message) override;
-  void ModalInformation(const char* message) override;
-  
+protected:
+  void StateChanged(StateChange changed) override;
+
 private:
   enum : int
   {
@@ -52,8 +48,7 @@ private:
 
   bool Create();
   void Destroy();
-  void UpdateProgress();
-  void AppendMessage(const char* message);
+  void AppendMessage(const std::string_view message);
 
   NSWindow* m_window = nil;
   NSView* m_view = nil;

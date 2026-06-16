@@ -10,10 +10,7 @@
     <height>617</height>
    </rect>
   </property>
-  <property name="windowTitle">
-   <string>Form</string>
-  </property>
-  <layout class="QVBoxLayout" name="verticalLayout" stretch="0,1">
+  <layout class="QVBoxLayout" name="verticalLayout" stretch="0,0">
    <property name="leftMargin">
     <number>0</number>
    </property>
@@ -42,15 +39,15 @@
           <property name="text">
            <string>Bindings</string>
           </property>
+          <property name="icon">
+           <iconset resource="resources/duckstation-qt.qrc">
+            <normaloff>:/icons/monochrome/svg/controller-digital-line.svg</normaloff>:/icons/monochrome/svg/controller-digital-line.svg</iconset>
+          </property>
           <property name="checkable">
            <bool>true</bool>
           </property>
-          <property name="icon">
-           <iconset theme="controller-digital-line">
-            <normaloff>.</normaloff>.</iconset>
-          </property>
           <property name="toolButtonStyle">
-           <enum>Qt::ToolButtonTextBesideIcon</enum>
+           <enum>Qt::ToolButtonStyle::ToolButtonTextBesideIcon</enum>
           </property>
           <property name="autoRaise">
            <bool>true</bool>
@@ -63,14 +60,14 @@
            <string>Settings</string>
           </property>
           <property name="icon">
-           <iconset theme="checkbox-multiple-blank-line">
-            <normaloff>.</normaloff>.</iconset>
+           <iconset resource="resources/duckstation-qt.qrc">
+            <normaloff>:/icons/monochrome/svg/checkbox-multiple-blank-line.svg</normaloff>:/icons/monochrome/svg/checkbox-multiple-blank-line.svg</iconset>
           </property>
           <property name="checkable">
            <bool>true</bool>
           </property>
           <property name="toolButtonStyle">
-           <enum>Qt::ToolButtonTextBesideIcon</enum>
+           <enum>Qt::ToolButtonStyle::ToolButtonTextBesideIcon</enum>
           </property>
           <property name="autoRaise">
            <bool>true</bool>
@@ -83,14 +80,14 @@
            <string>Macros</string>
           </property>
           <property name="icon">
-           <iconset theme="flashlight-line">
-            <normaloff>.</normaloff>.</iconset>
+           <iconset resource="resources/duckstation-qt.qrc">
+            <normaloff>:/icons/monochrome/svg/flashlight-line.svg</normaloff>:/icons/monochrome/svg/flashlight-line.svg</iconset>
           </property>
           <property name="checkable">
            <bool>true</bool>
           </property>
           <property name="toolButtonStyle">
-           <enum>Qt::ToolButtonTextBesideIcon</enum>
+           <enum>Qt::ToolButtonStyle::ToolButtonTextBesideIcon</enum>
           </property>
           <property name="autoRaise">
            <bool>true</bool>
@@ -102,7 +99,7 @@
       <item>
        <spacer name="horizontalSpacer">
         <property name="orientation">
-         <enum>Qt::Horizontal</enum>
+         <enum>Qt::Orientation::Horizontal</enum>
         </property>
         <property name="sizeHint" stdset="0">
          <size>
@@ -115,30 +112,24 @@
       <item>
        <layout class="QHBoxLayout" name="horizontalLayout_2">
         <item>
-         <widget class="QToolButton" name="automaticBinding">
+         <widget class="QPushButton" name="automaticBinding">
           <property name="text">
            <string>Automatic Mapping</string>
           </property>
           <property name="icon">
-           <iconset theme="controller-digital-line">
-            <normaloff>.</normaloff>.</iconset>
-          </property>
-          <property name="toolButtonStyle">
-           <enum>Qt::ToolButtonTextBesideIcon</enum>
+           <iconset resource="resources/duckstation-qt.qrc">
+            <normaloff>:/icons/monochrome/svg/controller-digital-line.svg</normaloff>:/icons/monochrome/svg/controller-digital-line.svg</iconset>
           </property>
          </widget>
         </item>
         <item>
-         <widget class="QToolButton" name="clearBindings">
+         <widget class="QPushButton" name="clearBindings">
           <property name="text">
            <string>Clear Mapping</string>
           </property>
           <property name="icon">
-           <iconset theme="trash-fill">
-            <normaloff>.</normaloff>.</iconset>
-          </property>
-          <property name="toolButtonStyle">
-           <enum>Qt::ToolButtonTextBesideIcon</enum>
+           <iconset resource="resources/duckstation-qt.qrc">
+            <normaloff>:/icons/monochrome/svg/trash-fill.svg</normaloff>:/icons/monochrome/svg/trash-fill.svg</iconset>
           </property>
          </widget>
         </item>
@@ -148,12 +139,12 @@
     </widget>
    </item>
    <item>
-    <widget class="QStackedWidget" name="stackedWidget" />
+    <widget class="QStackedWidget" name="stackedWidget"/>
    </item>
   </layout>
  </widget>
  <resources>
-  <include location="../resources/resources.qrc"/>
+  <include location="resources/duckstation-qt.qrc"/>
  </resources>
  <connections/>
 </ui>

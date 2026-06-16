@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 
@@ -14,9 +14,8 @@ public:
   explicit AboutDialog(QWidget* parent = nullptr);
   ~AboutDialog();
 
-  static void showThirdPartyNotices(QWidget* parent);
+  static void openThirdPartyNotices(QWidget* parent);
 
 private:
   Ui::AboutDialog m_ui;
-
 };

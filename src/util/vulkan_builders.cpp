@@ -1,9 +1,10 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "vulkan_builders.h"
 
 #include "common/assert.h"
+#include "common/error.h"
 #include "common/log.h"
 
 #include <limits>
@@ -103,15 +104,47 @@ const char* Vulkan::VkResultToString(VkResult res)
   }
 }
 
-void Vulkan::LogVulkanResult(const char* func_name, VkResult res, const char* msg, ...)
+void Vulkan::LogVulkanResult(const char* func_name, VkResult res, std::string_view msg)
 {
-  std::va_list ap;
-  va_start(ap, msg);
-  std::string real_msg = StringUtil::StdStringFromFormatV(msg, ap);
-  va_end(ap);
+  if (Log::GetLogLevel() < Log::Level::Error)
+    return;
 
-  Log::Writef("VulkanDevice", func_name, LOGLEVEL_ERROR, "%s (%d: %s)", real_msg.c_str(), static_cast<int>(res),
-              VkResultToString(res));
+  Log::WriteFuncName(Log::PackCategory(Log::Channel::GPUDevice, Log::Level::Error, Log::Color::Default), func_name,
+                     "{} (0x{:08X}: {})", msg, static_cast<unsigned>(res), VkResultToString(res));
+}
+
+void Vulkan::SetErrorObject(Error* errptr, std::string_view prefix, VkResult res)
+{
+  Error::SetStringFmt(errptr, "{} (0x{:08X}: {})", prefix, static_cast<unsigned>(res), VkResultToString(res));
+}
+
+u32 Vulkan::GetMaxMultisamples(VkPhysicalDevice physical_device, const VkPhysicalDeviceProperties& properties)
+{
+  VkImageFormatProperties color_properties = {};
+  vkGetPhysicalDeviceImageFormatProperties(physical_device, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D,
+                                           VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0,
+                                           &color_properties);
+  VkImageFormatProperties depth_properties = {};
+  vkGetPhysicalDeviceImageFormatProperties(physical_device, VK_FORMAT_D32_SFLOAT, VK_IMAGE_TYPE_2D,
+                                           VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,
+                                           &depth_properties);
+  const VkSampleCountFlags combined_properties = properties.limits.framebufferColorSampleCounts &
+                                                 properties.limits.framebufferDepthSampleCounts &
+                                                 color_properties.sampleCounts & depth_properties.sampleCounts;
+  if (combined_properties & VK_SAMPLE_COUNT_64_BIT)
+    return 64;
+  else if (combined_properties & VK_SAMPLE_COUNT_32_BIT)
+    return 32;
+  else if (combined_properties & VK_SAMPLE_COUNT_16_BIT)
+    return 16;
+  else if (combined_properties & VK_SAMPLE_COUNT_8_BIT)
+    return 8;
+  else if (combined_properties & VK_SAMPLE_COUNT_4_BIT)
+    return 4;
+  else if (combined_properties & VK_SAMPLE_COUNT_2_BIT)
+    return 2;
+  else
+    return 1;
 }
 
 Vulkan::DescriptorSetLayoutBuilder::DescriptorSetLayoutBuilder()
@@ -264,6 +297,12 @@ void Vulkan::GraphicsPipelineBuilder::Clear()
   m_line_rasterization_state = {};
   m_line_rasterization_state.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_EXT;
 
+  m_rendering = {};
+  m_rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
+
+  m_rendering_input_attachment_locations = {};
+  m_rendering_input_attachment_locations.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_LOCATION_INFO_KHR;
+
   // set defaults
   SetNoCullRasterizationState();
   SetNoDepthTestState();
@@ -276,14 +315,15 @@ void Vulkan::GraphicsPipelineBuilder::Clear()
   SetMultisamples(VK_SAMPLE_COUNT_1_BIT);
 }
 
-VkPipeline Vulkan::GraphicsPipelineBuilder::Create(VkDevice device, VkPipelineCache pipeline_cache,
-                                                   bool clear /* = true */)
+VkPipeline Vulkan::GraphicsPipelineBuilder::Create(VkDevice device, VkPipelineCache pipeline_cache, bool clear,
+                                                   Error* error)
 {
   VkPipeline pipeline;
   VkResult res = vkCreateGraphicsPipelines(device, pipeline_cache, 1, &m_ci, nullptr, &pipeline);
   if (res != VK_SUCCESS)
   {
     LOG_VULKAN_ERROR(res, "vkCreateGraphicsPipelines() failed: ");
+    SetErrorObject(error, "vkCreateGraphicsPipelines() failed: ", res);
     return VK_NULL_HANDLE;
   }
 
@@ -334,7 +374,7 @@ void Vulkan::GraphicsPipelineBuilder::AddVertexBuffer(u32 binding, u32 stride,
 
 void Vulkan::GraphicsPipelineBuilder::AddVertexAttribute(u32 location, u32 binding, VkFormat format, u32 offset)
 {
-  DebugAssert(m_vertex_input_state.vertexAttributeDescriptionCount < MAX_VERTEX_BUFFERS);
+  DebugAssert(m_vertex_input_state.vertexAttributeDescriptionCount < MAX_VERTEX_ATTRIBUTES);
 
   VkVertexInputAttributeDescription& a = m_vertex_attributes[m_vertex_input_state.vertexAttributeDescriptionCount];
   a.location = location;
@@ -569,6 +609,42 @@ void Vulkan::GraphicsPipelineBuilder::SetProvokingVertex(VkProvokingVertexModeEX
   m_provoking_vertex.provokingVertexMode = mode;
 }
 
+void Vulkan::GraphicsPipelineBuilder::SetDynamicRendering()
+{
+  AddPointerToChain(&m_ci, &m_rendering);
+}
+
+void Vulkan::GraphicsPipelineBuilder::AddDynamicRenderingColorAttachment(VkFormat format)
+{
+  SetDynamicRendering();
+
+  DebugAssert(m_rendering.colorAttachmentCount < MAX_ATTACHMENTS);
+  m_rendering_color_formats[m_rendering.colorAttachmentCount++] = format;
+
+  m_rendering.pColorAttachmentFormats = m_rendering_color_formats.data();
+}
+
+void Vulkan::GraphicsPipelineBuilder::SetDynamicRenderingDepthAttachment(VkFormat depth_format, VkFormat stencil_format)
+{
+  SetDynamicRendering();
+
+  m_rendering.depthAttachmentFormat = depth_format;
+  m_rendering.stencilAttachmentFormat = stencil_format;
+}
+
+void Vulkan::GraphicsPipelineBuilder::AddDynamicRenderingInputAttachment(u32 color_attachment_index)
+{
+  AddPointerToChain(&m_ci, &m_rendering_input_attachment_locations);
+
+  DebugAssert(color_attachment_index < m_rendering.colorAttachmentCount);
+  DebugAssert(m_rendering_input_attachment_locations.colorAttachmentCount < MAX_INPUT_ATTACHMENTS);
+
+  m_rendering_input_attachment_locations.pColorAttachmentLocations = m_rendering_input_attachment_indices.data();
+  m_rendering_input_attachment_indices[m_rendering_input_attachment_locations.colorAttachmentCount] =
+    color_attachment_index;
+  m_rendering_input_attachment_locations.colorAttachmentCount++;
+}
+
 Vulkan::ComputePipelineBuilder::ComputePipelineBuilder()
 {
   Clear();
@@ -583,14 +659,15 @@ void Vulkan::ComputePipelineBuilder::Clear()
   m_smap_constants = {};
 }
 
-VkPipeline Vulkan::ComputePipelineBuilder::Create(VkDevice device, VkPipelineCache pipeline_cache /*= VK_NULL_HANDLE*/,
-                                                  bool clear /*= true*/)
+VkPipeline Vulkan::ComputePipelineBuilder::Create(VkDevice device, VkPipelineCache pipeline_cache, bool clear,
+                                                  Error* error)
 {
   VkPipeline pipeline;
   VkResult res = vkCreateComputePipelines(device, pipeline_cache, 1, &m_ci, nullptr, &pipeline);
   if (res != VK_SUCCESS)
   {
     LOG_VULKAN_ERROR(res, "vkCreateComputePipelines() failed: ");
+    SetErrorObject(error, "vkCreateComputePipelines() failed: ", res);
     return VK_NULL_HANDLE;
   }
 

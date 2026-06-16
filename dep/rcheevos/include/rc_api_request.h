@@ -2,13 +2,22 @@
 #define RC_API_REQUEST_H
 
 #include "rc_error.h"
-#include "../src/rc_util.h"
+#include "rc_util.h"
 
 #include <stddef.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+RC_BEGIN_C_DECLS
+
+/**
+ * Information about the server being connected to.
+ */
+typedef struct rc_api_host_t {
+  /* The host name for the API calls (retroachievements.org) */
+  const char* host;
+  /* The host name for media URLs (media.retroachievements.org) */
+  const char* media_host;
+}
+rc_api_host_t;
 
 /**
  * A constructed request to send to the retroachievements server.
@@ -42,10 +51,12 @@ typedef struct rc_api_response_t {
 }
 rc_api_response_t;
 
-void rc_api_destroy_request(rc_api_request_t* request);
+RC_EXPORT void RC_CCONV rc_api_destroy_request(rc_api_request_t* request);
 
-void rc_api_set_host(const char* hostname);
-void rc_api_set_image_host(const char* hostname);
+/* [deprecated] use rc_api_init_*_hosted instead */
+RC_EXPORT void RC_CCONV rc_api_set_host(const char* hostname);
+/* [deprecated] use rc_api_init_*_hosted instead */
+RC_EXPORT void RC_CCONV rc_api_set_image_host(const char* hostname);
 
 typedef struct rc_api_server_response_t {
   /* Pointer to the data returned from the server */
@@ -61,8 +72,6 @@ enum {
   RC_API_SERVER_RESPONSE_RETRYABLE_CLIENT_ERROR = -2
 };
 
-#ifdef __cplusplus
-}
-#endif
+RC_END_C_DECLS
 
 #endif /* RC_API_REQUEST_H */

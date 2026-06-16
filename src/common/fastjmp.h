@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2021 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 
@@ -21,7 +21,9 @@ struct fastjmp_buf
 #elif defined(_M_IX86) || defined(__i386__)
   static constexpr std::size_t BUF_SIZE = 24;
 #elif defined(__riscv) && __riscv_xlen == 64
-  static constexpr std::size_t BUF_SIZE = 208;
+  static constexpr std::size_t BUF_SIZE = 216;
+#elif defined(__loongarch64)
+  static constexpr std::size_t BUF_SIZE = 160;
 #else
 #error Unknown architecture.
 #endif

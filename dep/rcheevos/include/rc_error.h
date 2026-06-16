@@ -1,9 +1,9 @@
 #ifndef RC_ERROR_H
 #define RC_ERROR_H
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+#include "rc_export.h"
+
+RC_BEGIN_C_DECLS
 
 /*****************************************************************************\
 | Return values                                                               |
@@ -11,7 +11,7 @@ extern "C" {
 
 enum {
   RC_OK = 0,
-  RC_INVALID_LUA_OPERAND = -1,
+  RC_INVALID_FUNC_OPERAND = -1,
   RC_INVALID_MEMORY_OPERAND = -2,
   RC_INVALID_CONST_OPERAND = -3,
   RC_INVALID_FP_OPERAND = -4,
@@ -45,13 +45,16 @@ enum {
   RC_NO_RESPONSE = -32,
   RC_ACCESS_DENIED = -33,
   RC_INVALID_CREDENTIALS = -34,
-  RC_EXPIRED_TOKEN = -35
+  RC_EXPIRED_TOKEN = -35,
+  RC_INSUFFICIENT_BUFFER = -36,
+  RC_INVALID_VARIABLE_NAME = -37,
+  RC_UNKNOWN_VARIABLE_NAME = -38,
+  RC_NOT_FOUND = -39,
+  RC_INVALID_VALUE = -40
 };
 
-const char* rc_error_str(int ret);
+RC_EXPORT const char* RC_CCONV rc_error_str(int ret);
 
-#ifdef __cplusplus
-}
-#endif
+RC_END_C_DECLS
 
 #endif /* RC_ERROR_H */

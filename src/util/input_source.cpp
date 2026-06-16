@@ -1,8 +1,11 @@
-// SPDX-FileCopyrightText: 2019-2022 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "input_source.h"
+
 #include "common/string_util.h"
+
+#include "fmt/format.h"
 
 InputSource::InputSource() = default;
 
@@ -15,6 +18,16 @@ void InputSource::UpdateMotorState(InputBindingKey large_key, InputBindingKey sm
     UpdateMotorState(large_key, large_intensity);
   if (small_key.bits != 0)
     UpdateMotorState(small_key, small_intensity);
+}
+
+InputBindingKey InputSource::MakeGenericControllerDeviceKey(InputSourceType clazz, u32 controller_index)
+{
+  InputBindingKey key = {};
+  key.source_type = clazz;
+  key.source_index = controller_index;
+  key.source_subtype = InputSubclass::None;
+  key.data = 0;
+  return key;
 }
 
 InputBindingKey InputSource::MakeGenericControllerAxisKey(InputSourceType clazz, u32 controller_index, s32 axis_index)
@@ -49,6 +62,17 @@ InputBindingKey InputSource::MakeGenericControllerHatKey(InputSourceType clazz, 
   return key;
 }
 
+InputBindingKey InputSource::MakeGenericControllerSensorKey(InputSourceType clazz, u32 controller_index,
+                                                            u32 sensor_index)
+{
+  InputBindingKey key = {};
+  key.source_type = clazz;
+  key.source_index = controller_index;
+  key.source_subtype = InputSubclass::ControllerSensor;
+  key.data = sensor_index;
+  return key;
+}
+
 InputBindingKey InputSource::MakeGenericControllerMotorKey(InputSourceType clazz, u32 controller_index, s32 motor_index)
 {
   InputBindingKey key = {};
@@ -59,9 +83,8 @@ InputBindingKey InputSource::MakeGenericControllerMotorKey(InputSourceType clazz
   return key;
 }
 
-std::optional<InputBindingKey> InputSource::ParseGenericControllerKey(InputSourceType clazz,
-                                                                      const std::string_view& source,
-                                                                      const std::string_view& sub_binding)
+std::optional<InputBindingKey> InputSource::ParseGenericControllerKey(InputSourceType clazz, std::string_view source,
+                                                                      std::string_view sub_binding)
 {
   // try to find the number, this function doesn't care about whether it's xinput or sdl or whatever
   std::string_view::size_type pos = 0;
@@ -75,14 +98,14 @@ std::optional<InputBindingKey> InputSource::ParseGenericControllerKey(InputSourc
     return std::nullopt;
 
   const std::optional<s32> source_index = StringUtil::FromChars<s32>(source.substr(pos));
-  if (source_index.has_value() || source_index.value() < 0)
+  if (!source_index.has_value() || source_index.value() < 0)
     return std::nullopt;
 
   InputBindingKey key = {};
   key.source_type = clazz;
   key.source_index = source_index.value();
 
-  if (StringUtil::StartsWith(sub_binding, "+Axis") || StringUtil::StartsWith(sub_binding, "-Axis"))
+  if (sub_binding.starts_with("+Axis") || sub_binding.starts_with("-Axis"))
   {
     const std::optional<s32> axis_number = StringUtil::FromChars<s32>(sub_binding.substr(5));
     if (!axis_number.has_value() || axis_number.value() < 0)
@@ -98,7 +121,7 @@ std::optional<InputBindingKey> InputSource::ParseGenericControllerKey(InputSourc
     else
       return std::nullopt;
   }
-  else if (StringUtil::StartsWith(sub_binding, "FullAxis"))
+  else if (sub_binding.starts_with("FullAxis"))
   {
     const std::optional<s32> axis_number = StringUtil::FromChars<s32>(sub_binding.substr(8));
     if (!axis_number.has_value() || axis_number.value() < 0)
@@ -107,7 +130,7 @@ std::optional<InputBindingKey> InputSource::ParseGenericControllerKey(InputSourc
     key.data = static_cast<u32>(axis_number.value());
     key.modifier = InputModifier::FullAxis;
   }
-  else if (StringUtil::StartsWith(sub_binding, "Button"))
+  else if (sub_binding.starts_with("Button"))
   {
     const std::optional<s32> button_number = StringUtil::FromChars<s32>(sub_binding.substr(6));
     if (!button_number.has_value() || button_number.value() < 0)
@@ -128,7 +151,7 @@ std::string InputSource::ConvertGenericControllerKeyToString(InputBindingKey key
 {
   if (key.source_subtype == InputSubclass::ControllerAxis)
   {
-    const char* modifier = "";
+    const char* modifier;
     switch (key.modifier)
     {
       case InputModifier::None:
@@ -139,6 +162,9 @@ std::string InputSource::ConvertGenericControllerKeyToString(InputBindingKey key
         break;
       case InputModifier::FullAxis:
         modifier = "Full";
+        break;
+      default:
+        modifier = "";
         break;
     }
     return fmt::format("{}-{}/{}Axis{}", InputManager::InputSourceToString(key.source_type),

@@ -1,8 +1,8 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "gpu_device.h"
-#include "vulkan_loader.h"
+#include "vulkan_headers.h"
 
 class VulkanDevice;
 
@@ -15,7 +15,9 @@ public:
 
   ALWAYS_INLINE VkShaderModule GetModule() const { return m_module; }
 
-  void SetDebugName(const std::string_view& name) override;
+#ifdef ENABLE_GPU_OBJECT_NAMES
+  void SetDebugName(std::string_view name) override;
+#endif
 
 private:
   VulkanShader(GPUShaderStage stage, VkShaderModule mod);
@@ -32,12 +34,18 @@ public:
 
   ALWAYS_INLINE VkPipeline GetPipeline() const { return m_pipeline; }
   ALWAYS_INLINE Layout GetLayout() const { return m_layout; }
+  ALWAYS_INLINE u8 GetVerticesPerPrimitive() const { return m_vertices_per_primitive; }
+  ALWAYS_INLINE RenderPassFlag GetRenderPassFlags() const { return m_render_pass_flags; }
 
-  void SetDebugName(const std::string_view& name) override;
+#ifdef ENABLE_GPU_OBJECT_NAMES
+  void SetDebugName(std::string_view name) override;
+#endif
 
 private:
-  VulkanPipeline(VkPipeline pipeline, Layout layout);
+  VulkanPipeline(VkPipeline pipeline, Layout layout, u8 vertices_per_primitive, RenderPassFlag render_pass_flags);
 
   VkPipeline m_pipeline;
   Layout m_layout;
+  u8 m_vertices_per_primitive;
+  RenderPassFlag m_render_pass_flags;
 };

@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2019-2022 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "memorycardsettingswidget.h"
 
@@ -15,9 +15,22 @@
 #include "common/small_string.h"
 #include "common/string_util.h"
 
+#include "fmt/format.h"
+
 #include <QtCore/QUrl>
+#include <QtWidgets/QComboBox>
 #include <QtWidgets/QFileDialog>
+#include <QtWidgets/QGridLayout>
+#include <QtWidgets/QGroupBox>
 #include <QtWidgets/QLabel>
+#include <QtWidgets/QLineEdit>
+#include <QtWidgets/QVBoxLayout>
+
+#include <functional>
+
+#include "moc_memorycardsettingswidget.cpp"
+
+using namespace Qt::StringLiterals;
 
 static constexpr char MEMORY_CARD_IMAGE_FILTER[] =
   QT_TRANSLATE_NOOP("MemoryCardSettingsWidget", "All Memory Card Types (*.mcd *.mcr *.mc)");
@@ -32,35 +45,82 @@ MemoryCardSettingsWidget::~MemoryCardSettingsWidget() = default;
 
 void MemoryCardSettingsWidget::createUi(SettingsWindow* dialog)
 {
-  QVBoxLayout* layout = new QVBoxLayout(this);
+  QVBoxLayout* const layout = new QVBoxLayout(this);
   layout->setContentsMargins(0, 0, 0, 0);
 
   for (int i = 0; i < static_cast<int>(m_port_ui.size()); i++)
   {
     createPortSettingsUi(dialog, i, &m_port_ui[i]);
     layout->addWidget(m_port_ui[i].container);
+    onMemoryCardTypeChanged(i);
   }
 
   {
-    QGroupBox* box = new QGroupBox(tr("Shared Settings"), this);
-    QVBoxLayout* box_layout = new QVBoxLayout(box);
-    QPushButton* browse = new QPushButton(tr("Browse..."), box);
-    QPushButton* reset = new QPushButton(tr("Reset"), box);
-    QPushButton* open_memcards = new QPushButton(tr("Open Directory..."), box);
+    QGroupBox* const box = new QGroupBox(tr("Save Locations"), this);
+    QGridLayout* const box_layout = new QGridLayout(box);
+    layout->addWidget(box);
 
     {
-      QLabel* label = new QLabel(tr("Memory Card Directory:"), box);
-      box_layout->addWidget(label);
-
-      QHBoxLayout* hbox = new QHBoxLayout();
-      m_memory_card_directory = new QLineEdit(box);
-
-      hbox->addWidget(m_memory_card_directory);
+      QHBoxLayout* const hbox = new QHBoxLayout();
+      QLabel* const label = new QLabel(tr("Memory Cards:"), box);
+      box_layout->addWidget(label, 0, 0);
+      QLineEdit* const directory = new QLineEdit(box);
+      QPushButton* const browse = new QPushButton(box);
+      browse->setToolTip(tr("Browse..."));
+      browse->setIcon(QIcon(u":/icons/monochrome/svg/folder-open-line.svg"_s));
+      QPushButton* const open = new QPushButton(box);
+      open->setToolTip(tr("Open..."));
+      open->setIcon(QIcon(u":/icons/monochrome/svg/open-folder-line.svg"_s));
+      QPushButton* const reset = new QPushButton(box);
+      reset->setToolTip(qApp->translate("QPlatformTheme", "Reset"));
+      reset->setIcon(QIcon(u":/icons/monochrome/svg/delete-back-2-line.svg"_s));
+      hbox->addWidget(directory);
       hbox->addWidget(browse);
+      hbox->addWidget(open);
       hbox->addWidget(reset);
+      box_layout->addLayout(hbox, 0, 1);
 
-      box_layout->addLayout(hbox);
+      SettingWidgetBinder::BindWidgetToFolderSetting(m_dialog->getSettingsInterface(), directory, browse,
+                                                     tr("Select Memory Card Directory"), open, reset, "MemoryCards",
+                                                     "Directory", Path::Combine(EmuFolders::DataRoot, "memcards"));
+
+      dialog->registerWidgetHelp(directory, tr("Memory Cards Location"), tr("Default"),
+                                 tr("Specifies the directory where memory cards will be saved."));
     }
+
+    {
+      QHBoxLayout* const hbox = new QHBoxLayout();
+      QLabel* const label = new QLabel(tr("Save States:"), box);
+      box_layout->addWidget(label, 1, 0);
+      QLineEdit* const directory = new QLineEdit(box);
+      QPushButton* const browse = new QPushButton(box);
+      browse->setToolTip(tr("Browse..."));
+      browse->setIcon(QIcon(u":/icons/monochrome/svg/folder-open-line.svg"_s));
+      QPushButton* const open = new QPushButton(box);
+      open->setToolTip(tr("Open..."));
+      open->setIcon(QIcon(u":/icons/monochrome/svg/open-folder-line.svg"_s));
+      QPushButton* const reset = new QPushButton(box);
+      reset->setToolTip(qApp->translate("QPlatformTheme", "Reset"));
+      reset->setIcon(QIcon(u":/icons/monochrome/svg/delete-back-2-line.svg"_s));
+      hbox->addWidget(directory);
+      hbox->addWidget(browse);
+      hbox->addWidget(open);
+      hbox->addWidget(reset);
+      box_layout->addLayout(hbox, 1, 1);
+
+      SettingWidgetBinder::BindWidgetToFolderSetting(m_dialog->getSettingsInterface(), directory, browse,
+                                                     tr("Select Save States Directory"), open, reset, "Folders",
+                                                     "SaveStates", Path::Combine(EmuFolders::DataRoot, "savestates"));
+
+      dialog->registerWidgetHelp(directory, tr("Save States Location"), tr("Default"),
+                                 tr("Specifies the directory where save states will be saved."));
+    }
+  }
+
+  {
+    QGroupBox* const box = new QGroupBox(tr("Game-Specific Card Settings"), this);
+    QVBoxLayout* const box_layout = new QVBoxLayout(box);
+    layout->addWidget(box);
 
     QCheckBox* playlist_title_as_game_title = new QCheckBox(tr("Use Single Card For Multi-Disc Games"), box);
     SettingWidgetBinder::BindWidgetToBoolSetting(m_dialog->getSettingsInterface(), playlist_title_as_game_title,
@@ -74,38 +134,18 @@ void MemoryCardSettingsWidget::createUi(SettingsWindow* dialog)
     box_layout->addWidget(QtUtils::CreateHorizontalLine(box));
 
     {
-
-      QHBoxLayout* note_layout = new QHBoxLayout();
-      QLabel* note_label =
-        new QLabel(tr("If one of the \"separate card per game\" memory card types is chosen, these memory "
-                      "cards will be saved to the memory cards directory."),
-                   box);
-      note_label->setWordWrap(true);
-      note_layout->addWidget(note_label, 1);
-
-      note_layout->addWidget(open_memcards);
-      box_layout->addLayout(note_layout);
-    }
-
-    {
-      QHBoxLayout* hbox = new QHBoxLayout();
-      QLabel* label = new QLabel(
+      QHBoxLayout* const hbox = new QHBoxLayout();
+      QLabel* const label = new QLabel(
         tr("The memory card editor enables you to move saves between cards, as well as import cards of other formats."),
         box);
       label->setWordWrap(true);
       hbox->addWidget(label, 1);
 
-      QPushButton* button = new QPushButton(tr("Memory Card Editor..."), box);
+      QPushButton* const button = new QPushButton(tr("Memory Card Editor..."), box);
       connect(button, &QPushButton::clicked, []() { g_main_window->openMemoryCardEditor(QString(), QString()); });
       hbox->addWidget(button);
       box_layout->addLayout(hbox);
     }
-
-    layout->addWidget(box);
-
-    SettingWidgetBinder::BindWidgetToFolderSetting(m_dialog->getSettingsInterface(), m_memory_card_directory, browse,
-                                                   open_memcards, reset, "MemoryCards", "Directory",
-                                                   Path::Combine(EmuFolders::DataRoot, "memcards"));
   }
 
   layout->addStretch(1);
@@ -127,9 +167,10 @@ void MemoryCardSettingsWidget::createPortSettingsUi(SettingsWindow* dialog, int 
 
   const MemoryCardType default_value = (index == 0) ? MemoryCardType::PerGameTitle : MemoryCardType::None;
   SettingWidgetBinder::BindWidgetToEnumSetting(m_dialog->getSettingsInterface(), ui->memory_card_type, "MemoryCards",
-                                               fmt::format("Card{}Type", index + 1),
-                                               &Settings::ParseMemoryCardTypeName, &Settings::GetMemoryCardTypeName,
-                                               default_value);
+                                               fmt::format("Card{}Type", index + 1), &Settings::ParseMemoryCardTypeName,
+                                               &Settings::GetMemoryCardTypeName, default_value);
+  connect(ui->memory_card_type, &QComboBox::currentIndexChanged, this,
+          std::bind(&MemoryCardSettingsWidget::onMemoryCardTypeChanged, this, index));
   ui->layout->addWidget(new QLabel(tr("Memory Card Type:"), ui->container));
   ui->layout->addWidget(ui->memory_card_type);
 
@@ -144,20 +185,43 @@ void MemoryCardSettingsWidget::createPortSettingsUi(SettingsWindow* dialog, int 
   }
   memory_card_layout->addWidget(ui->memory_card_path);
 
-  QPushButton* memory_card_path_browse = new QPushButton(tr("Browse..."), ui->container);
-  connect(memory_card_path_browse, &QPushButton::clicked, this,
+  ui->memory_card_path_browse = new QPushButton(ui->container);
+  ui->memory_card_path_browse->setIcon(QIcon(u":/icons/monochrome/svg/folder-open-line.svg"_s));
+  ui->memory_card_path_browse->setToolTip(tr("Browse..."));
+  connect(ui->memory_card_path_browse, &QPushButton::clicked, this,
           [this, index]() { onBrowseMemoryCardPathClicked(index); });
-  memory_card_layout->addWidget(memory_card_path_browse);
+  memory_card_layout->addWidget(ui->memory_card_path_browse);
 
-  QPushButton* memory_card_path_reset = new QPushButton(tr("Reset"), ui->container);
-  connect(memory_card_path_reset, &QPushButton::clicked, this,
+  ui->memory_card_path_reset = new QPushButton(ui->container);
+  ui->memory_card_path_reset->setIcon(QIcon(u":/icons/monochrome/svg/delete-back-2-line.svg"_s));
+  ui->memory_card_path_reset->setToolTip(qApp->translate("QPlatformTheme", "Reset"));
+  connect(ui->memory_card_path_reset, &QPushButton::clicked, this,
           [this, index]() { onResetMemoryCardPathClicked(index); });
-  memory_card_layout->addWidget(memory_card_path_reset);
+  memory_card_layout->addWidget(ui->memory_card_path_reset);
 
-  ui->layout->addWidget(new QLabel(tr("Shared Memory Card Path:"), ui->container));
+  ui->memory_card_path_label = new QLabel(tr("Shared Memory Card Path:"), ui->container);
+  ui->layout->addWidget(ui->memory_card_path_label);
   ui->layout->addLayout(memory_card_layout);
 
   ui->layout->addStretch(1);
+}
+
+void MemoryCardSettingsWidget::onMemoryCardTypeChanged(int index)
+{
+  const MemoryCardType default_type =
+    (index == 0) ? Settings::DEFAULT_MEMORY_CARD_1_TYPE : Settings::DEFAULT_MEMORY_CARD_2_TYPE;
+  const MemoryCardType type =
+    Settings::ParseMemoryCardTypeName(m_dialog
+                                        ->getEffectiveStringValue("MemoryCards",
+                                                                  TinyString::from_format("Card{}Type", index + 1),
+                                                                  Settings::GetMemoryCardTypeName(default_type))
+                                        .c_str())
+      .value_or(default_type);
+  const bool shared_enabled = (type == MemoryCardType::Shared);
+  m_port_ui[index].memory_card_path_label->setEnabled(shared_enabled);
+  m_port_ui[index].memory_card_path->setEnabled(shared_enabled);
+  m_port_ui[index].memory_card_path_browse->setEnabled(shared_enabled);
+  m_port_ui[index].memory_card_path_reset->setEnabled(shared_enabled);
 }
 
 void MemoryCardSettingsWidget::onBrowseMemoryCardPathClicked(int index)
@@ -172,7 +236,7 @@ void MemoryCardSettingsWidget::onBrowseMemoryCardPathClicked(int index)
 
 void MemoryCardSettingsWidget::onMemoryCardPathChanged(int index)
 {
-  const auto key = TinyString::from_fmt("Card{}Path", index + 1);
+  const auto key = TinyString::from_format("Card{}Path", index + 1);
   std::string relative_path(
     Path::MakeRelative(m_port_ui[index].memory_card_path->text().toStdString(), EmuFolders::MemoryCards));
   m_dialog->setStringSettingValue("MemoryCards", key, relative_path.c_str());
@@ -180,7 +244,7 @@ void MemoryCardSettingsWidget::onMemoryCardPathChanged(int index)
 
 void MemoryCardSettingsWidget::onResetMemoryCardPathClicked(int index)
 {
-  const auto key = TinyString::from_fmt("Card{}Path", index + 1);
+  const auto key = TinyString::from_format("Card{}Path", index + 1);
   if (m_dialog->isPerGameSettings())
     m_dialog->removeSettingValue("MemoryCards", key);
   else
@@ -191,7 +255,7 @@ void MemoryCardSettingsWidget::onResetMemoryCardPathClicked(int index)
 
 void MemoryCardSettingsWidget::updateMemoryCardPath(int index)
 {
-  const auto key = TinyString::from_fmt("Card{}Path", index + 1);
+  const auto key = TinyString::from_format("Card{}Path", index + 1);
   std::string path(
     m_dialog->getEffectiveStringValue("MemoryCards", key, Settings::GetDefaultSharedMemoryCardName(index).c_str()));
   if (!Path::IsAbsolute(path))

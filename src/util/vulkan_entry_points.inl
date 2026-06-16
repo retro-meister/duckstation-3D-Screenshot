@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 // Expands the VULKAN_ENTRY_POINT macro for each function when this file is included.
 // Parameters: Function name, is required
@@ -14,12 +14,12 @@ VULKAN_MODULE_ENTRY_POINT(vkGetInstanceProcAddr, true)
 VULKAN_MODULE_ENTRY_POINT(vkEnumerateInstanceExtensionProperties, true)
 VULKAN_MODULE_ENTRY_POINT(vkEnumerateInstanceLayerProperties, true)
 VULKAN_MODULE_ENTRY_POINT(vkEnumerateInstanceVersion, false)
-VULKAN_MODULE_ENTRY_POINT(vkDestroyInstance, true)
 
 #endif // VULKAN_MODULE_ENTRY_POINT
 
 #ifdef VULKAN_INSTANCE_ENTRY_POINT
 
+VULKAN_INSTANCE_ENTRY_POINT(vkDestroyInstance, true)
 VULKAN_INSTANCE_ENTRY_POINT(vkGetDeviceProcAddr, true)
 VULKAN_INSTANCE_ENTRY_POINT(vkEnumeratePhysicalDevices, true)
 VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceFeatures, true)
@@ -40,12 +40,10 @@ VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceSurfacePresentModesKHR, false)
 
 #if defined(VK_USE_PLATFORM_WIN32_KHR)
 VULKAN_INSTANCE_ENTRY_POINT(vkCreateWin32SurfaceKHR, false)
-VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceWin32PresentationSupportKHR, false)
 #endif
 
-#if defined(VK_USE_PLATFORM_XLIB_KHR)
-VULKAN_INSTANCE_ENTRY_POINT(vkCreateXlibSurfaceKHR, false)
-VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceXlibPresentationSupportKHR, false)
+#if defined(VK_USE_PLATFORM_XCB_KHR)
+VULKAN_INSTANCE_ENTRY_POINT(vkCreateXcbSurfaceKHR, false)
 #endif
 
 #if defined(VK_USE_PLATFORM_WAYLAND_KHR)
@@ -83,10 +81,15 @@ VULKAN_INSTANCE_ENTRY_POINT(vkCreateDisplayModeKHR, false)
 VULKAN_INSTANCE_ENTRY_POINT(vkGetDisplayPlaneCapabilitiesKHR, false)
 VULKAN_INSTANCE_ENTRY_POINT(vkCreateDisplayPlaneSurfaceKHR, false)
 
+// VK_KHR_get_physical_device_properties2
+VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceFeatures2KHR, false)
+VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceProperties2KHR, false)
+VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceMemoryProperties2KHR, false)
+
 // Vulkan 1.1 functions.
-VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceFeatures2, true)
-VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceProperties2, true)
-VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceMemoryProperties2, true)
+VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceFeatures2, false)
+VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceProperties2, false)
+VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceMemoryProperties2, false)
 
 // VK_EXT_calibrated_timestamps
 VULKAN_INSTANCE_ENTRY_POINT(vkGetPhysicalDeviceCalibrateableTimeDomainsEXT, false)
@@ -222,10 +225,10 @@ VULKAN_DEVICE_ENTRY_POINT(vkAcquireNextImageKHR, false)
 VULKAN_DEVICE_ENTRY_POINT(vkQueuePresentKHR, false)
 
 // Vulkan 1.1 functions.
-VULKAN_DEVICE_ENTRY_POINT(vkGetBufferMemoryRequirements2, true)
-VULKAN_DEVICE_ENTRY_POINT(vkGetImageMemoryRequirements2, true)
-VULKAN_DEVICE_ENTRY_POINT(vkBindBufferMemory2, true)
-VULKAN_DEVICE_ENTRY_POINT(vkBindImageMemory2, true)
+VULKAN_DEVICE_ENTRY_POINT(vkGetBufferMemoryRequirements2, false)
+VULKAN_DEVICE_ENTRY_POINT(vkGetImageMemoryRequirements2, false)
+VULKAN_DEVICE_ENTRY_POINT(vkBindBufferMemory2, false)
+VULKAN_DEVICE_ENTRY_POINT(vkBindImageMemory2, false)
 
 // Vulkan 1.3 functions.
 VULKAN_DEVICE_ENTRY_POINT(vkGetDeviceBufferMemoryRequirements, false)
@@ -236,7 +239,20 @@ VULKAN_DEVICE_ENTRY_POINT(vkAcquireFullScreenExclusiveModeEXT, false)
 VULKAN_DEVICE_ENTRY_POINT(vkReleaseFullScreenExclusiveModeEXT, false)
 #endif
 
+// VK_KHR_dynamic_rendering
+VULKAN_DEVICE_ENTRY_POINT(vkCmdBeginRenderingKHR, false)
+VULKAN_DEVICE_ENTRY_POINT(vkCmdEndRenderingKHR, false)
+
 // VK_KHR_push_descriptor
 VULKAN_DEVICE_ENTRY_POINT(vkCmdPushDescriptorSetKHR, false)
+
+// VK_KHR_swapchain_maintenance1
+VULKAN_DEVICE_ENTRY_POINT(vkReleaseSwapchainImagesKHR, false)
+
+// VK_EXT_external_memory_host
+VULKAN_DEVICE_ENTRY_POINT(vkGetMemoryHostPointerPropertiesEXT, false)
+
+// VK_EXT_swapchain_maintenance1
+VULKAN_DEVICE_ENTRY_POINT(vkReleaseSwapchainImagesEXT, false)
 
 #endif // VULKAN_DEVICE_ENTRY_POINT

@@ -1,10 +1,6 @@
 #ifndef RC_CLIENT_INTERNAL_H
 #define RC_CLIENT_INTERNAL_H
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 #include "rc_client.h"
 
 #ifdef RC_CLIENT_SUPPORTS_RAINTEGRATION
@@ -13,21 +9,28 @@ extern "C" {
 #ifdef RC_CLIENT_SUPPORTS_EXTERNAL
  #include "rc_client_external.h"
 #endif
+#ifdef RC_CLIENT_SUPPORTS_HASH
+ #include "rhash/rc_hash_internal.h"
+#endif
 
 #include "rc_compat.h"
 #include "rc_runtime.h"
 #include "rc_runtime_types.h"
 
+RC_BEGIN_C_DECLS
+
 /*****************************************************************************\
 | Callbacks                                                                   |
 \*****************************************************************************/
 
-struct rc_api_fetch_game_data_response_t;
-typedef void (*rc_client_post_process_game_data_response_t)(const rc_api_server_response_t* server_response,
-              struct rc_api_fetch_game_data_response_t* game_data_response, rc_client_t* client, void* userdata);
-typedef int (*rc_client_can_submit_achievement_unlock_t)(uint32_t achievement_id, rc_client_t* client);
-typedef int (*rc_client_can_submit_leaderboard_entry_t)(uint32_t leaderboard_id, rc_client_t* client);
-typedef int (*rc_client_rich_presence_override_t)(rc_client_t* client, char buffer[], size_t buffersize);
+struct rc_api_fetch_game_sets_response_t;
+typedef void (RC_CCONV *rc_client_post_process_game_sets_response_t)(const rc_api_server_response_t* server_response,
+              struct rc_api_fetch_game_sets_response_t* game_sets_response, rc_client_t* client, void* userdata);
+typedef int (RC_CCONV *rc_client_can_submit_achievement_unlock_t)(uint32_t achievement_id, rc_client_t* client);
+typedef int (RC_CCONV *rc_client_can_submit_leaderboard_entry_t)(uint32_t leaderboard_id, rc_client_t* client);
+typedef int (RC_CCONV *rc_client_rich_presence_override_t)(rc_client_t* client, char buffer[], size_t buffersize);
+typedef uint32_t (RC_CCONV* rc_client_identify_hash_func_t)(uint32_t console_id, const char* hash,
+                  rc_client_t* client, void* callback_userdata);
 
 typedef struct rc_client_callbacks_t {
   rc_client_read_memory_func_t read_memory;
@@ -35,16 +38,21 @@ typedef struct rc_client_callbacks_t {
   rc_client_server_call_t server_call;
   rc_client_message_callback_t log_call;
   rc_get_time_millisecs_func_t get_time_millisecs;
-  rc_client_post_process_game_data_response_t post_process_game_data_response;
+  rc_client_identify_hash_func_t identify_unknown_hash;
+  rc_client_post_process_game_sets_response_t post_process_game_sets_response;
   rc_client_can_submit_achievement_unlock_t can_submit_achievement_unlock;
   rc_client_can_submit_leaderboard_entry_t can_submit_leaderboard_entry;
   rc_client_rich_presence_override_t rich_presence_override;
+
+#ifdef RC_CLIENT_SUPPORTS_HASH
+  rc_hash_callbacks_t hash;
+#endif
 
   void* client_data;
 } rc_client_callbacks_t;
 
 struct rc_client_scheduled_callback_data_t;
-typedef void (*rc_client_scheduled_callback_t)(struct rc_client_scheduled_callback_data_t* callback_data, rc_client_t* client, rc_clock_t now);
+typedef void (RC_CCONV *rc_client_scheduled_callback_t)(struct rc_client_scheduled_callback_data_t* callback_data, rc_client_t* client, rc_clock_t now);
 
 typedef struct rc_client_scheduled_callback_data_t
 {
@@ -92,7 +100,7 @@ typedef struct rc_client_achievement_info_t {
 } rc_client_achievement_info_t;
 
 struct rc_client_achievement_list_info_t;
-typedef void (*rc_client_destroy_achievement_list_func_t)(struct rc_client_achievement_list_info_t* list);
+typedef void (RC_CCONV *rc_client_destroy_achievement_list_func_t)(struct rc_client_achievement_list_info_t* list);
 
 typedef struct rc_client_achievement_list_info_t {
   rc_client_achievement_list_t public_;
@@ -167,7 +175,7 @@ typedef struct rc_client_leaderboard_info_t {
 } rc_client_leaderboard_info_t;
 
 struct rc_client_leaderboard_list_info_t;
-typedef void (*rc_client_destroy_leaderboard_list_func_t)(struct rc_client_leaderboard_list_info_t* list);
+typedef void (RC_CCONV *rc_client_destroy_leaderboard_list_func_t)(struct rc_client_leaderboard_list_info_t* list);
 
 typedef struct rc_client_leaderboard_list_info_t {
   rc_client_leaderboard_list_t public_;
@@ -175,7 +183,7 @@ typedef struct rc_client_leaderboard_list_info_t {
 } rc_client_leaderboard_list_info_t;
 
 struct rc_client_leaderboard_entry_list_info_t;
-typedef void (*rc_client_destroy_leaderboard_entry_list_func_t)(struct rc_client_leaderboard_entry_list_info_t* list);
+typedef void (RC_CCONV *rc_client_destroy_leaderboard_entry_list_func_t)(struct rc_client_leaderboard_entry_list_info_t* list);
 
 typedef struct rc_client_leaderboard_entry_list_info_t {
   rc_client_leaderboard_entry_list_t public_;
@@ -206,6 +214,7 @@ typedef struct rc_client_subset_info_t {
   const char* inactive_label;
   const char* locked_label;
   const char* unlocked_label;
+  const char* unlocked_softcore_label;
   const char* unofficial_label;
   const char* unsupported_label;
 
@@ -214,7 +223,13 @@ typedef struct rc_client_subset_info_t {
   uint8_t pending_events;
 } rc_client_subset_info_t;
 
-rc_client_async_handle_t* rc_client_begin_load_subset(rc_client_t* client, uint32_t subset_id, rc_client_callback_t callback, void* callback_userdata);
+struct rc_client_subset_list_info_t;
+typedef void (RC_CCONV* rc_client_destroy_subset_list_func_t)(struct rc_client_subset_list_info_t* list);
+
+typedef struct rc_client_subset_list_info_t {
+  rc_client_subset_list_t public_;
+  rc_client_destroy_subset_list_func_t destroy_func;
+} rc_client_subset_list_info_t;
 
 /*****************************************************************************\
 | Game                                                                        |
@@ -222,6 +237,7 @@ rc_client_async_handle_t* rc_client_begin_load_subset(rc_client_t* client, uint3
 
 typedef struct rc_client_game_hash_t {
   char hash[33];
+  uint8_t is_unknown;
   uint32_t game_id;
   struct rc_client_game_hash_t* next;
 } rc_client_game_hash_t;
@@ -268,16 +284,6 @@ void rc_client_update_active_leaderboards(rc_client_game_info_t* game);
 \*****************************************************************************/
 
 enum {
-  RC_CLIENT_LOAD_STATE_NONE,
-  RC_CLIENT_LOAD_STATE_IDENTIFYING_GAME,
-  RC_CLIENT_LOAD_STATE_AWAIT_LOGIN,
-  RC_CLIENT_LOAD_STATE_FETCHING_GAME_DATA,
-  RC_CLIENT_LOAD_STATE_STARTING_SESSION,
-  RC_CLIENT_LOAD_STATE_DONE,
-  RC_CLIENT_LOAD_STATE_UNKNOWN_GAME
-};
-
-enum {
   RC_CLIENT_USER_STATE_NONE,
   RC_CLIENT_USER_STATE_LOGIN_REQUESTED,
   RC_CLIENT_USER_STATE_LOGGED_IN
@@ -309,13 +315,20 @@ typedef struct rc_client_state_t {
   rc_buffer_t buffer;
 
   rc_client_scheduled_callback_data_t* scheduled_callbacks;
+  rc_api_host_t host;
 
 #ifdef RC_CLIENT_SUPPORTS_EXTERNAL
   rc_client_external_t* external_client;
+  struct rc_client_external_conversions_t* external_client_conversions;
 #endif
 #ifdef RC_CLIENT_SUPPORTS_RAINTEGRATION
   rc_client_raintegration_t* raintegration;
 #endif
+
+  uint32_t frames_processed;
+  uint32_t frames_at_last_ping;
+  uint16_t unpaused_frame_decay;
+  uint16_t required_unpaused_frames;
 
   uint8_t hardcore;
   uint8_t encore_mode;
@@ -324,6 +337,8 @@ typedef struct rc_client_state_t {
   uint8_t log_level;
   uint8_t user;
   uint8_t disconnect;
+  uint8_t allow_leaderboards_in_softcore;
+  uint8_t allow_background_memory_reads;
 
   struct rc_client_load_state_t* load;
   struct rc_client_async_handle_t* async_handles[4];
@@ -373,8 +388,10 @@ int rc_value_contains_memref(const rc_value_t* value, const rc_memref_t* memref)
 /* end runtime.c internals */
 
 /* helper functions for unit tests */
+#ifdef RC_CLIENT_SUPPORTS_HASH
 struct rc_hash_iterator;
 struct rc_hash_iterator* rc_client_get_load_state_hash_iterator(rc_client_t* client);
+#endif
 /* end helper functions for unit tests */
 
 enum {
@@ -385,10 +402,9 @@ enum {
 
 void rc_client_set_legacy_peek(rc_client_t* client, int method);
 
+void rc_client_allocate_leaderboard_tracker(rc_client_game_info_t* game, rc_client_leaderboard_info_t* leaderboard);
 void rc_client_release_leaderboard_tracker(rc_client_game_info_t* game, rc_client_leaderboard_info_t* leaderboard);
 
-#ifdef __cplusplus
-}
-#endif
+RC_END_C_DECLS
 
 #endif /* RC_CLIENT_INTERNAL_H */

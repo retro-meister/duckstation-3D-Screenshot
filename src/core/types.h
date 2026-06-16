@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2019-2022 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 #include "common/types.h"
@@ -21,8 +21,10 @@ enum class MemoryAccessSize : u32
 };
 
 using TickCount = s32;
+using GlobalTicks = u64;
+using GameHash = u64;
 
-enum class ConsoleRegion
+enum class ConsoleRegion : u8
 {
   Auto,
   NTSC_J,
@@ -46,7 +48,6 @@ enum class CPUExecutionMode : u8
   Interpreter,
   CachedInterpreter,
   Recompiler,
-  NewRec,
   Count
 };
 
@@ -77,6 +78,16 @@ enum class GPURenderer : u8
   Count
 };
 
+enum class DisplayDeinterlacingMode : u8
+{
+  Disabled,
+  Weave,
+  Blend,
+  Adaptive,
+  Progressive,
+  Count
+};
+
 enum class GPUTextureFilter : u8
 {
   Nearest,
@@ -86,7 +97,24 @@ enum class GPUTextureFilter : u8
   JINC2BinAlpha,
   xBR,
   xBRBinAlpha,
+  Scale2x,
+  Scale3x,
+  MMPX,
+  MMPXEnhanced,
+  MMPXAdvanced,
   Count
+};
+
+enum class GPUDitheringMode : u8
+{
+  Unscaled,
+  UnscaledShaderBlend,
+  Scaled,
+  ScaledShaderBlend,
+  TrueColor,
+  TrueColorFull,
+
+  MaxCount,
 };
 
 enum class GPUDownsampleMode : u8
@@ -105,25 +133,44 @@ enum class GPUWireframeMode : u8
   Count,
 };
 
+enum class GPULineDetectMode : u8
+{
+  Disabled,
+  Quads,
+  BasicTriangles,
+  AggressiveTriangles,
+  Count
+};
+
+enum class GPUDumpCompressionMode : u8
+{
+  Disabled,
+  ZstLow,
+  ZstDefault,
+  ZstHigh,
+  XZLow,
+  XZDefault,
+  XZHigh,
+  MaxCount
+};
+
 enum class DisplayCropMode : u8
 {
   None,
   Overscan,
+  OverscanUncorrected,
   Borders,
-  Count
+  BordersUncorrected,
+  MaxCount
 };
 
-enum class DisplayAspectRatio : u8
+enum class DisplayFineCropMode : u8
 {
-  Auto,
-  MatchWindow,
-  Custom,
-  R4_3,
-  R16_9,
-  R19_9,
-  R20_9,
-  PAR1_1,
-  Count
+  None,
+  VideoResolution,
+  InternalResolution,
+  WindowResolution,
+  MaxCount
 };
 
 enum class DisplayAlignment : u8
@@ -134,32 +181,98 @@ enum class DisplayAlignment : u8
   Count
 };
 
+enum class DisplayRotation : u8
+{
+  Normal,
+  Rotate90,
+  Rotate180,
+  Rotate270,
+  Count
+};
+
 enum class DisplayScalingMode : u8
 {
   Nearest,
-  BilinearSmooth,
   NearestInteger,
+  BilinearSmooth,
+  BilinearHybrid,
   BilinearSharp,
+  BilinearInteger,
+  Lanczos,
   Count
 };
 
-enum class AudioBackend : u8
+enum class DisplayExclusiveFullscreenControl : u8
 {
-  Null,
-#ifdef ENABLE_CUBEB
-  Cubeb,
-#endif
-#ifdef _WIN32
-  XAudio2,
-#endif
-#ifdef __ANDROID__
-  AAudio,
-  OpenSLES,
-#endif
+  Automatic,
+  Disallowed,
+  Allowed,
   Count
 };
 
-enum class ControllerType
+enum class DisplayScreenshotMode : u8
+{
+  ScreenResolution,
+  InternalResolution,
+  UncorrectedInternalResolution,
+  Count
+};
+
+enum class DisplayScreenshotFormat : u8
+{
+  PNG,
+  JPEG,
+  WebP,
+  Count
+};
+
+enum class CaptureFileNameFormat : u8
+{
+  Timestamp,
+  TitleAndTimestamp,
+  TimestampInFolder,
+  TitleAndTimestampInFolder,
+  Count
+};
+
+enum class PresentSkipMode : u8
+{
+  Disabled,
+  WhenVSyncBlocks,
+  Always,
+};
+
+enum class NotificationLocation : u8
+{
+  TopLeft,
+  TopCenter,
+  TopRight,
+  BottomLeft,
+  BottomCenter,
+  BottomRight,
+  MaxCount
+};
+
+enum class AchievementChallengeIndicatorMode : u8
+{
+  Disabled,
+  PersistentIcon,
+  TemporaryIcon,
+  Notification,
+
+  MaxCount
+};
+
+enum class AchievementProgressIndicatorMode : u8
+{
+  Disabled,
+  Icon,
+  IconAndTitle,
+
+  MaxCount
+};
+
+enum class ControllerType : u8
 {
   None,
   DigitalController,
@@ -168,10 +281,15 @@ enum class ControllerType
   GunCon,
   PlayStationMouse,
   NeGcon,
+  NeGconRumble,
+  Justifier,
+  PopnController,
+  DDGoController,
+  JogCon,
   Count
 };
 
-enum class MemoryCardType
+enum class MemoryCardType : u8
 {
   None,
   Shared,
@@ -182,7 +300,7 @@ enum class MemoryCardType
   Count
 };
 
-enum class MultitapMode
+enum class MultitapMode : u8
 {
   Disabled,
   Port1Only,
@@ -194,10 +312,11 @@ enum class MultitapMode
 enum : u32
 {
   NUM_CONTROLLER_AND_CARD_PORTS = 8,
-  NUM_MULTITAPS = 2
+  NUM_MULTITAPS = 2,
+  NUM_CONTROLLER_AND_CARD_PORTS_PER_MULTITAP = NUM_CONTROLLER_AND_CARD_PORTS / NUM_MULTITAPS,
 };
 
-enum class CPUFastmemMode
+enum class CPUFastmemMode : u8
 {
   Disabled,
   MMap,
@@ -222,4 +341,56 @@ enum class CDROMMechaconVersion : u8
   VC3C,
 
   Count,
+};
+
+enum class SaveStateCompressionMode : u8
+{
+  Uncompressed,
+  DeflateLow,
+  DeflateDefault,
+  DeflateHigh,
+  ZstLow,
+  ZstDefault,
+  ZstHigh,
+  XZLow,
+  XZDefault,
+  XZHigh,
+
+  Count,
+};
+
+enum class ForceVideoTimingMode : u8
+{
+  Disabled,
+  NTSC,
+  PAL,
+
+  Count,
+};
+
+enum class PIODeviceType : u8
+{
+  None,
+  XplorerCart,
+  MaxCount,
+};
+
+struct DisplayAspectRatio
+{
+  s16 numerator;
+  s16 denominator;
+
+  static constexpr DisplayAspectRatio Auto() { return {0, 0}; }
+  static constexpr DisplayAspectRatio Stretch() { return {-1, -1}; }
+  static constexpr DisplayAspectRatio PAR1_1() { return {-1, 0}; }
+
+  ALWAYS_INLINE bool operator==(const DisplayAspectRatio& rhs) const
+  {
+    return (std::memcmp(this, &rhs, sizeof(DisplayAspectRatio)) == 0);
+  }
+  ALWAYS_INLINE bool operator!=(const DisplayAspectRatio& rhs) const
+  {
+    return (std::memcmp(this, &rhs, sizeof(DisplayAspectRatio)) != 0);
+  }
+  ALWAYS_INLINE bool IsValid() const { return (numerator > 0 && denominator > 0); }
 };

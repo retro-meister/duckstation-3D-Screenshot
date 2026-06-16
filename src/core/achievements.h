@@ -1,20 +1,22 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 
 #include "common/small_string.h"
 #include "common/types.h"
 
+#include <array>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
-struct rc_client_t;
-
 class Error;
+class ProgressCallback;
 class StateWrapper;
 class CDImage;
 
@@ -28,38 +30,74 @@ enum class LoginRequestReason
   TokenInvalid,
 };
 
+inline constexpr size_t GAME_HASH_LENGTH = 16;
+using GameHash = std::array<u8, GAME_HASH_LENGTH>;
+
+class ProgressDatabase
+{
+public:
+  struct Entry
+  {
+    u32 game_id;
+    u16 num_achievements;
+    u16 num_achievements_unlocked;
+    u16 num_hc_achievements_unlocked;
+  };
+
+  ProgressDatabase();
+  ~ProgressDatabase();
+
+  bool Load(Error* error);
+
+  const Entry* LookupHash(const GameHash& hash) const;
+
+private:
+  struct HashEntry
+  {
+    GameHash hash;
+    u32 game_id;
+  };
+
+  std::vector<HashEntry> m_hashes;
+  std::vector<Entry> m_entries;
+};
+
 /// Acquires the achievements lock. Must be held when accessing any achievement state from another thread.
 std::unique_lock<std::recursive_mutex> GetLock();
 
-/// Returns the rc_client instance. Should have the lock held.
-rc_client_t* GetClient();
+/// Returns the achievements game hash for a given disc.
+std::optional<GameHash> GetGameHash(CDImage* image);
+std::optional<GameHash> GetGameHash(const std::string_view executable_name, std::span<const u8> executable_data);
 
-/// Initializes the RetroAchievments client.
-bool Initialize();
+/// Converts a game hash to a string for display. If the hash is nullopt, returns "[NO HASH]".
+TinyString GameHashToString(const std::optional<GameHash>& hash);
 
 /// Updates achievements settings.
 void UpdateSettings(const Settings& old_config);
 
-/// Resets the internal state of all achievement tracking. Call on system reset.
-void ResetClient();
+/// Call to refresh the game database.
+bool RefreshGameList(ProgressCallback* progress, Error* error);
 
-/// Called when the system is being reset. If it returns false, the reset should be aborted.
-bool ConfirmSystemReset();
+/// Call to refresh the all-progress database.
+bool RefreshAllProgressDatabase(ProgressCallback* progress, Error* error);
 
-/// Called when the system is being shut down. If Shutdown() returns false, the shutdown should be aborted.
-bool Shutdown(bool allow_cancel);
+/// Called when the system is start. Engages hardcore mode if enabled.
+void OnSystemStarting(CDImage* image, bool disable_hardcore_mode);
 
-/// Called when the system is being paused and resumed.
-void OnSystemPaused(bool paused);
+/// Called when the system is shutting down. If this returns false, the shutdown should be aborted.
+void OnSystemDestroyed();
+
+/// Called when the system is being reset. Resets the internal state of all achievement tracking.
+void OnSystemReset();
+
+/// Called when the system changes game.
+void GameChanged(CDImage* image);
 
 /// Called once a frame at vsync time on the CPU thread.
 void FrameUpdate();
 
 /// Called when the system is paused, because FrameUpdate() won't be getting called.
 void IdleUpdate();
-
-/// Returns true if idle updates are necessary (e.g. outstanding requests).
-bool NeedsIdleUpdate();
 
 /// Saves/loads state.
 bool DoState(StateWrapper& sw);
@@ -71,24 +109,18 @@ bool Login(const char* username, const char* password, Error* error);
 /// Logs out of RetroAchievements, clearing any credentials.
 void Logout();
 
-/// Called when the system changes game, or is booting.
-void GameChanged(const std::string& path, CDImage* image);
-
-/// Re-enables hardcode mode if it is enabled in the settings.
-bool ResetHardcoreMode();
-
 /// Forces hardcore mode off until next reset.
-void DisableHardcoreMode();
+void DisableHardcoreMode(bool show_message, bool display_game_summary);
 
-/// Prompts the user to disable hardcore mode, if they agree, returns true.
-bool ConfirmHardcoreModeDisable(const char* trigger);
-void ConfirmHardcoreModeDisableAsync(const char* trigger, std::function<void(bool)> callback);
+/// Prompts the user to disable hardcore mode. Invokes callback with result.
+void ConfirmHardcoreModeDisableAsync(std::string_view trigger, std::function<void(bool)> callback);
 
 /// Returns true if hardcore mode is active, and functionality should be restricted.
 bool IsHardcoreModeActive();
 
 /// RAIntegration only exists for Windows, so no point checking it on other platforms.
 bool IsUsingRAIntegration();
+bool IsRAIntegrationAvailable();
 
 /// Returns true if the achievement system is active. Achievements can be active without a valid client.
 bool IsActive();
@@ -115,61 +147,71 @@ bool HasRichPresence();
 /// Should be called with the lock held.
 const std::string& GetRichPresenceString();
 
+/// Returns the URL for the current icon of the game
+const std::string& GetCurrentGameBadgeURL();
+
 /// Returns the RetroAchievements title for the current game.
 /// Should be called with the lock held.
-const std::string& GetGameTitle();
+const std::string& GetCurrentGameTitle();
 
-/// Clears all cached state used to render the UI.
-void ClearUIState();
+/// Returns the path for the game that is current hashed/running.
+const std::string& GetCurrentGamePath();
 
-/// Draws ImGui overlays when not paused.
-void DrawGameOverlays();
+/// Returns true if the user has been successfully logged in.
+bool IsLoggedIn();
 
-/// Draws ImGui overlays when paused.
-void DrawPauseMenuOverlays();
+/// Returns true if the user has been successfully logged in, or the request is in progress.
+bool IsLoggedInOrLoggingIn();
 
-#ifndef __ANDROID__
+/// Returns true if credentials have been saved for login.
+bool HasSavedCredentials();
 
-/// Queries the achievement list, and if no achievements are available, returns false.
-bool PrepareAchievementsWindow();
+/// Returns the logged-in user name.
+const std::string& GetLoggedInUserName();
 
-/// Renders the achievement list.
-void DrawAchievementsWindow();
+/// Returns the path to the user's profile avatar.
+/// Should be called with the lock held.
+const std::string& GetLoggedInUserIconURL();
 
-/// Queries the leaderboard list, and if no leaderboards are available, returns false.
-bool PrepareLeaderboardsWindow();
+/// Returns a summary of the user's points.
+/// Should be called with the lock held.
+SmallString GetLoggedInUserPointsSummary();
 
-/// Renders the leaderboard list.
-void DrawLeaderboardsWindow();
+/// Returns the URL for the specified game icon, using the game ID.
+std::string GetGameBadgeURL(u32 game_id);
 
-#endif // __ANDROID__
+/// Returns 0 if pausing is allowed, otherwise the number of frames until pausing is allowed.
+u32 GetPauseThrottleFrames();
 
-#ifdef ENABLE_RAINTEGRATION
-/// Prevents the internal implementation from being used. Instead, RAIntegration will be
-/// called into when achievement-related events occur.
-void SwitchToRAIntegration();
+/// Returns the number of unlocks that have not been synchronized with the server.
+u32 GetPendingUnlockCount();
 
-namespace RAIntegration {
-void MainWindowChanged(void* new_handle);
-void GameChanged();
-std::vector<std::tuple<int, std::string, bool>> GetMenuItems();
-void ActivateMenuItem(int item);
-} // namespace RAIntegration
-#endif
+/// The name of the RetroAchievements icon, which can be used in notifications.
+extern const char* const RA_LOGO_ICON_NAME;
+extern const char* const RA_LOGO_SVG_ICON_NAME;
+
 } // namespace Achievements
 
 /// Functions implemented in the frontend.
 namespace Host {
+
 /// Called if the big picture UI requests achievements login, or token login fails.
 void OnAchievementsLoginRequested(Achievements::LoginRequestReason reason);
 
 /// Called when achievements login completes.
 void OnAchievementsLoginSuccess(const char* display_name, u32 points, u32 sc_points, u32 unread_messages);
 
-/// Called whenever game details or rich presence information is updated.
-/// Implementers can assume the lock is held when this is called.
-void OnAchievementsRefreshed();
+/// Called when achievements login completes or they are disabled.
+void OnAchievementsActiveChanged(bool active);
 
 /// Called whenever hardcore mode is toggled.
 void OnAchievementsHardcoreModeChanged(bool enabled);
+
+#ifdef RC_CLIENT_SUPPORTS_RAINTEGRATION
+
+/// Called when the RAIntegration menu changes.
+void OnRAIntegrationMenuChanged();
+
+#endif
+
 } // namespace Host

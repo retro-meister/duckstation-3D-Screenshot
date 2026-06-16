@@ -3,11 +3,15 @@
 
 # binaries folder
 /bin/
-/Build/
 /build/
 /build-*/
 
-# vs stuff
+# dependency build temp files
+deps-build/
+/deps/
+
+# IDE stuff:
+# Visual Studio
 .vs
 ipch
 ipch/*
@@ -18,6 +22,8 @@ ipch/*
 *.VC.opendb
 *.VC.db
 /.vscode/
+# CLion
+/.idea/
 
 # cmake stuff
 CMakeCache.txt
@@ -25,6 +31,7 @@ CMakeFiles
 Makefile
 cmake_install.cmake
 install_manifest.txt
+/.cache/
 
 # unix intermediate files
 config.h
@@ -40,9 +47,5 @@ CMakeLists.txt.user
 __pycache__
 
 # other repos
-/dep/mac
 /android
 
-# UWP crap
-Generated Files
-/packages

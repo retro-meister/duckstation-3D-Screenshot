@@ -1,25 +1,23 @@
+# SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
+# SPDX-License-Identifier: CC-BY-NC-ND-4.0 + Packaging Restriction
+#
+# NOTE: In addition to the terms of CC-BY-NC-ND-4.0, you may not use this file to create
+# packages or build recipes without explicit permission from the copyright holder.
+
 add_executable(updater
   updater.cpp
   updater.h
 )
 
-target_link_libraries(updater PRIVATE common minizip zlib)
-
-if(WIN32)
-  target_sources(updater PRIVATE
-    win32_main.cpp
-    win32_progress_callback.cpp
-    win32_progress_callback.h
-  )
-  target_link_libraries(updater PRIVATE "Comctl32.lib")
-  set_target_properties(updater PROPERTIES WIN32_EXECUTABLE TRUE)
-endif()
+target_include_directories(updater PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_link_libraries(updater PRIVATE common minizip ZLIB::ZLIB)
 
 if(APPLE)
   set(MAC_SOURCES
     cocoa_main.mm
     cocoa_progress_callback.mm
     cocoa_progress_callback.h
+    updater_progress_callback.h
   )
   target_sources(updater PRIVATE ${MAC_SOURCES})
   set_source_files_properties(${MAC_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS TRUE)

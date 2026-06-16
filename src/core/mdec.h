@@ -1,7 +1,8 @@
-// SPDX-FileCopyrightText: 2019-2022 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
+
 #include "types.h"
 
 class StateWrapper;
@@ -13,6 +14,10 @@ void Shutdown();
 void Reset();
 bool DoState(StateWrapper& sw);
 
+bool IsActive();
+bool IsDecodingMacroblock();
+void EndFrame();
+
 // I/O
 u32 ReadRegister(u32 offset);
 void WriteRegister(u32 offset, u32 value);
@@ -20,6 +25,6 @@ void WriteRegister(u32 offset, u32 value);
 void DMARead(u32* words, u32 word_count);
 void DMAWrite(const u32* words, u32 word_count);
 
-void DrawDebugStateWindow();
+void DrawDebugStateWindow(float scale);
 
 } // namespace MDEC

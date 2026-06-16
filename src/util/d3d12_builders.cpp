@@ -1,17 +1,15 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "d3d12_builders.h"
 #include "d3d12_device.h"
 
 #include "common/assert.h"
-#include "common/log.h"
+#include "common/error.h"
 #include "common/string_util.h"
 
 #include <cstdarg>
 #include <limits>
-
-Log_SetChannel(D3D12Device);
 
 D3D12::GraphicsPipelineBuilder::GraphicsPipelineBuilder()
 {
@@ -27,14 +25,14 @@ void D3D12::GraphicsPipelineBuilder::Clear()
   m_desc.SampleDesc.Count = 1;
 }
 
-Microsoft::WRL::ComPtr<ID3D12PipelineState> D3D12::GraphicsPipelineBuilder::Create(ID3D12Device* device,
-                                                                                   bool clear /*= true*/)
+Microsoft::WRL::ComPtr<ID3D12PipelineState> D3D12::GraphicsPipelineBuilder::Create(ID3D12Device* device, Error* error,
+                                                                                   bool clear)
 {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> ps;
   HRESULT hr = device->CreateGraphicsPipelineState(&m_desc, IID_PPV_ARGS(ps.GetAddressOf()));
   if (FAILED(hr))
   {
-    Log_ErrorPrintf("CreateGraphicsPipelineState() failed: %08X", hr);
+    Error::SetHResult(error, "CreateGraphicsPipelineState() failed: ", hr);
     return {};
   }
 
@@ -120,11 +118,6 @@ void D3D12::GraphicsPipelineBuilder::SetMultisamples(u32 multisamples)
   m_desc.SampleDesc.Count = multisamples;
 }
 
-void D3D12::GraphicsPipelineBuilder::SetNoCullRasterizationState()
-{
-  SetRasterizationState(D3D12_FILL_MODE_SOLID, D3D12_CULL_MODE_NONE, false);
-}
-
 void D3D12::GraphicsPipelineBuilder::SetDepthState(bool depth_test, bool depth_write, D3D12_COMPARISON_FUNC compare_op)
 {
   m_desc.DepthStencilState.DepthEnable = depth_test;
@@ -141,11 +134,6 @@ void D3D12::GraphicsPipelineBuilder::SetStencilState(bool stencil_test, u8 read_
   m_desc.DepthStencilState.StencilWriteMask = write_mask;
   m_desc.DepthStencilState.FrontFace = front;
   m_desc.DepthStencilState.BackFace = back;
-}
-
-void D3D12::GraphicsPipelineBuilder::SetNoDepthTestState()
-{
-  SetDepthState(false, false, D3D12_COMPARISON_FUNC_ALWAYS);
 }
 
 void D3D12::GraphicsPipelineBuilder::SetNoStencilState()
@@ -170,18 +158,6 @@ void D3D12::GraphicsPipelineBuilder::SetBlendState(u32 rt, bool blend_enable, D3
 
   if (rt > 0)
     m_desc.BlendState.IndependentBlendEnable = TRUE;
-}
-
-void D3D12::GraphicsPipelineBuilder::SetColorWriteMask(u32 rt, u8 write_mask /* = D3D12_COLOR_WRITE_ENABLE_ALL */)
-{
-  m_desc.BlendState.RenderTarget[rt].RenderTargetWriteMask = write_mask;
-}
-
-void D3D12::GraphicsPipelineBuilder::SetNoBlendingState()
-{
-  SetBlendState(0, false, D3D12_BLEND_ONE, D3D12_BLEND_ZERO, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
-                D3D12_BLEND_OP_ADD, D3D12_COLOR_WRITE_ENABLE_ALL);
-  m_desc.BlendState.IndependentBlendEnable = FALSE;
 }
 
 void D3D12::GraphicsPipelineBuilder::ClearRenderTargets()
@@ -218,14 +194,14 @@ void D3D12::ComputePipelineBuilder::Clear()
   std::memset(&m_desc, 0, sizeof(m_desc));
 }
 
-Microsoft::WRL::ComPtr<ID3D12PipelineState> D3D12::ComputePipelineBuilder::Create(ID3D12Device* device,
-                                                                                  bool clear /*= true*/)
+Microsoft::WRL::ComPtr<ID3D12PipelineState> D3D12::ComputePipelineBuilder::Create(ID3D12Device* device, Error* error,
+                                                                                  bool clear)
 {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> ps;
   HRESULT hr = device->CreateComputePipelineState(&m_desc, IID_PPV_ARGS(ps.GetAddressOf()));
-  if (FAILED(hr))
+  if (FAILED(hr)) [[unlikely]]
   {
-    Log_ErrorPrintf("CreateComputePipelineState() failed: %08X", hr);
+    Error::SetHResult(error, "CreateComputePipelineState() failed: ", hr);
     return {};
   }
 
@@ -260,9 +236,9 @@ void D3D12::RootSignatureBuilder::Clear()
   m_num_descriptor_ranges = 0;
 }
 
-Microsoft::WRL::ComPtr<ID3D12RootSignature> D3D12::RootSignatureBuilder::Create(bool clear /*= true*/)
+Microsoft::WRL::ComPtr<ID3D12RootSignature> D3D12::RootSignatureBuilder::Create(Error* error, bool clear)
 {
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> rs = D3D12Device::GetInstance().CreateRootSignature(&m_desc);
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> rs = D3D12Device::GetInstance().CreateRootSignature(&m_desc, error);
   if (!rs)
     return {};
 
@@ -280,6 +256,7 @@ void D3D12::RootSignatureBuilder::SetInputAssemblerFlag()
 u32 D3D12::RootSignatureBuilder::Add32BitConstants(u32 shader_reg, u32 num_values, D3D12_SHADER_VISIBILITY visibility)
 {
   const u32 index = m_desc.NumParameters++;
+  DebugAssert(index < MAX_PARAMETERS);
 
   m_params[index].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   m_params[index].ShaderVisibility = visibility;
@@ -293,6 +270,7 @@ u32 D3D12::RootSignatureBuilder::Add32BitConstants(u32 shader_reg, u32 num_value
 u32 D3D12::RootSignatureBuilder::AddCBVParameter(u32 shader_reg, D3D12_SHADER_VISIBILITY visibility)
 {
   const u32 index = m_desc.NumParameters++;
+  DebugAssert(index < MAX_PARAMETERS);
 
   m_params[index].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
   m_params[index].ShaderVisibility = visibility;
@@ -305,6 +283,7 @@ u32 D3D12::RootSignatureBuilder::AddCBVParameter(u32 shader_reg, D3D12_SHADER_VI
 u32 D3D12::RootSignatureBuilder::AddSRVParameter(u32 shader_reg, D3D12_SHADER_VISIBILITY visibility)
 {
   const u32 index = m_desc.NumParameters++;
+  DebugAssert(index < MAX_PARAMETERS);
 
   m_params[index].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
   m_params[index].ShaderVisibility = visibility;
@@ -319,6 +298,8 @@ u32 D3D12::RootSignatureBuilder::AddDescriptorTable(D3D12_DESCRIPTOR_RANGE_TYPE 
 {
   const u32 index = m_desc.NumParameters++;
   const u32 dr_index = m_num_descriptor_ranges++;
+  DebugAssert(index < MAX_PARAMETERS);
+  DebugAssert(dr_index < MAX_DESCRIPTOR_RANGES);
 
   m_descriptor_ranges[dr_index].RangeType = rt;
   m_descriptor_ranges[dr_index].NumDescriptors = num_shader_regs;
@@ -334,19 +315,58 @@ u32 D3D12::RootSignatureBuilder::AddDescriptorTable(D3D12_DESCRIPTOR_RANGE_TYPE 
   return index;
 }
 
-#ifdef _DEBUG
-
-void D3D12::SetObjectName(ID3D12Object* object, const std::string_view& name)
+u32 D3D12::RootSignatureBuilder::AddStaticSampler(u32 shader_reg, const D3D12_SAMPLER_DESC& sampler_desc,
+                                                  D3D12_SHADER_VISIBILITY visibility)
 {
-  object->SetName(StringUtil::UTF8StringToWideString(name).c_str());
+  static constexpr const std::pair<std::array<float, 4>, D3D12_STATIC_BORDER_COLOR> border_color_mapping[] = {
+    {{{0.0f, 0.0f, 0.0f, 0.0f}}, D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK},
+    {{{0.0f, 0.0f, 0.0f, 1.0f}}, D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK},
+    {{{1.0f, 1.0f, 1.0f, 1.0f}}, D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE},
+  };
+
+  const u32 index = m_desc.NumStaticSamplers++;
+  DebugAssert(index < MAX_STATIC_SAMPLERS);
+  m_desc.pStaticSamplers = m_static_samplers.data();
+
+  D3D12_STATIC_SAMPLER_DESC& ssdesc = m_static_samplers[index];
+  ssdesc.Filter = sampler_desc.Filter;
+  ssdesc.AddressU = sampler_desc.AddressU;
+  ssdesc.AddressV = sampler_desc.AddressV;
+  ssdesc.AddressW = sampler_desc.AddressW;
+  ssdesc.MipLODBias = sampler_desc.MipLODBias;
+  ssdesc.MaxAnisotropy = sampler_desc.MaxAnisotropy;
+  ssdesc.ComparisonFunc = sampler_desc.ComparisonFunc;
+  ssdesc.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+  if (sampler_desc.AddressU == D3D12_TEXTURE_ADDRESS_MODE_BORDER ||
+      sampler_desc.AddressV == D3D12_TEXTURE_ADDRESS_MODE_BORDER ||
+      sampler_desc.AddressW == D3D12_TEXTURE_ADDRESS_MODE_BORDER)
+  {
+    u32 i;
+    for (i = 0; i < static_cast<u32>(std::size(border_color_mapping)); i++)
+    {
+      if (std::memcmp(border_color_mapping[i].first.data(), sampler_desc.BorderColor, sizeof(float) * 4) == 0)
+        break;
+    }
+    if (i == std::size(border_color_mapping))
+      Panic("Unsupported border color");
+    else
+      ssdesc.BorderColor = border_color_mapping[i].second;
+  }
+
+  ssdesc.MinLOD = sampler_desc.MinLOD;
+  ssdesc.MaxLOD = sampler_desc.MaxLOD;
+  ssdesc.ShaderRegister = shader_reg;
+  ssdesc.RegisterSpace = 0;
+  ssdesc.ShaderVisibility = visibility;
+
+  return index;
 }
 
-void D3D12::SetObjectNameFormatted(ID3D12Object* object, const char* format, ...)
+#ifdef ENABLE_GPU_OBJECT_NAMES
+
+void D3D12::SetObjectName(ID3D12Object* object, std::string_view name)
 {
-  std::va_list ap;
-  va_start(ap, format);
-  SetObjectName(object, StringUtil::StdStringFromFormatV(format, ap).c_str());
-  va_end(ap);
+  object->SetName(StringUtil::UTF8StringToWideString(name).c_str());
 }
 
 #endif

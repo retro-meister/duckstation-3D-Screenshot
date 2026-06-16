@@ -1,14 +1,15 @@
-// SPDX-FileCopyrightText: 2019-2022 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
+
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <type_traits>
 
 // Force inline helper
-#ifndef ALWAYS_INLINE
 #if defined(_MSC_VER)
 #define ALWAYS_INLINE __forceinline
 #elif defined(__GNUC__) || defined(__clang__)
@@ -16,13 +17,21 @@
 #else
 #define ALWAYS_INLINE inline
 #endif
-#endif
 
 // Force inline in non-debug helper
 #ifdef _DEBUG
 #define ALWAYS_INLINE_RELEASE inline
 #else
 #define ALWAYS_INLINE_RELEASE ALWAYS_INLINE
+#endif
+
+// Prevent inlining
+#if defined(_MSC_VER)
+#define NEVER_INLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define NEVER_INLINE __attribute__((noinline))
+#else
+#define NEVER_INLINE
 #endif
 
 // unreferenced parameter macro
@@ -45,15 +54,23 @@ char (&__countof_ArraySizeHelper(T (&array)[N]))[N];
 #endif
 #endif
 
-// offsetof macro
-#ifndef offsetof
-#define offsetof(st, m) ((size_t)((char*)&((st*)(0))->m - (char*)0))
+// offsetof macro. Need to use __builtin_offsetof(), otherwise it doesn't work in constant expressions.
+#if defined(__clang__) || defined(__GNUC__)
+
+#define OFFSETOF(st, m) __builtin_offsetof(st, m)
+
+#define PRINTFLIKE(n, m) __attribute__((format(printf, n, m)))
+
+#else
+
+#ifdef offsetof
+#define OFFSETOF(st, m) offsetof(st, m)
+#else
+#define OFFSETOF(st, m) ((size_t)((char*)&((st*)(0))->m - (char*)0))
 #endif
 
-#ifdef __GNUC__
-#define printflike(n, m) __attribute__((format(printf, n, m)))
-#else
-#define printflike(n, m)
+#define PRINTFLIKE(n, m)
+
 #endif
 
 // [[noreturn]] which can be used on function pointers.
@@ -76,9 +93,24 @@ char (&__countof_ArraySizeHelper(T (&array)[N]))[N];
   } while (0)
 #endif
 
+// __restrict, potentially enables optimization by hinting the compiler that the object is unique.
+#ifdef _MSC_VER
+#define RESTRICT __restrict
+#else
+#define RESTRICT __restrict__
+#endif
+
+// msvc requires a different attribute, of course
+#ifdef _MSC_VER
+#define NO_UNIQUE_ADDRESS [[msvc::no_unique_address]]
+#else
+#define NO_UNIQUE_ADDRESS [[no_unique_address]]
+#endif
+
 // disable warnings that show up at warning level 4
 // TODO: Move to build system instead
 #ifdef _MSC_VER
+#pragma warning(disable : 4200) // warning C4200: nonstandard extension used: zero-sized array in struct/union
 #pragma warning(disable : 4201) // warning C4201: nonstandard extension used : nameless struct/union
 #pragma warning(disable : 4100) // warning C4100: 'Platform' : unreferenced formal parameter
 #pragma warning(disable : 4355) // warning C4355: 'this' : used in base member initializer list
@@ -130,6 +162,8 @@ struct dependent_int_false : std::false_type
 #define CPU_ARCH_ARM32 1
 #elif defined(__riscv) && __riscv_xlen == 64
 #define CPU_ARCH_RISCV64 1
+#elif defined(__loongarch64)
+#define CPU_ARCH_LOONGARCH64 1
 #else
 #error Unknown architecture.
 #endif
@@ -150,6 +184,8 @@ struct dependent_int_false : std::false_type
 #define CPU_ARCH_STR "arm64"
 #elif defined(CPU_ARCH_RISCV64)
 #define CPU_ARCH_STR "riscv64"
+#elif defined(CPU_ARCH_LOONGARCH64)
+#define CPU_ARCH_STR "loongarch64"
 #else
 #define CPU_ARCH_STR "Unknown"
 #endif
@@ -170,15 +206,41 @@ struct dependent_int_false : std::false_type
 #endif
 
 // Host page sizes.
-#if defined(__APPLE__) && defined(__aarch64__)
-static constexpr u32 HOST_PAGE_SIZE = 0x4000;
-static constexpr u32 HOST_PAGE_MASK = HOST_PAGE_SIZE - 1;
-static constexpr u32 HOST_PAGE_SHIFT = 14;
-#else
-static constexpr u32 HOST_PAGE_SIZE = 0x1000;
-static constexpr u32 HOST_PAGE_MASK = HOST_PAGE_SIZE - 1;
-static constexpr u32 HOST_PAGE_SHIFT = 12;
+#if defined(MIN_HOST_PAGE_SIZE) || defined(MAX_HOST_PAGE_SIZE)
+#if !defined(MIN_HOST_PAGE_SIZE) || !defined(MAX_HOST_PAGE_SIZE)
+#error Both MIN_HOST_PAGE_SIZE and MAX_HOST_PAGE_SIZE need to be defined.
 #endif
+#define DYNAMIC_HOST_PAGE_SIZE 1
+extern const u32 HOST_PAGE_SIZE;
+extern const u32 HOST_PAGE_MASK;
+extern const u32 HOST_PAGE_SHIFT;
+#else
+#if defined(OVERRIDE_HOST_PAGE_SIZE)
+inline constexpr u32 HOST_PAGE_SIZE = OVERRIDE_HOST_PAGE_SIZE;
+inline constexpr u32 HOST_PAGE_MASK = HOST_PAGE_SIZE - 1;
+inline constexpr u32 HOST_PAGE_SHIFT = std::bit_width(HOST_PAGE_MASK);
+#elif defined(__APPLE__) && defined(__aarch64__)
+inline constexpr u32 HOST_PAGE_SIZE = 0x4000;
+inline constexpr u32 HOST_PAGE_MASK = HOST_PAGE_SIZE - 1;
+inline constexpr u32 HOST_PAGE_SHIFT = 14;
+#else
+inline constexpr u32 HOST_PAGE_SIZE = 0x1000;
+inline constexpr u32 HOST_PAGE_MASK = HOST_PAGE_SIZE - 1;
+inline constexpr u32 HOST_PAGE_SHIFT = 12;
+#endif
+inline constexpr u32 MIN_HOST_PAGE_SIZE = HOST_PAGE_SIZE;
+inline constexpr u32 MAX_HOST_PAGE_SIZE = HOST_PAGE_SIZE;
+#endif
+
+// Host cache line sizes.
+#if defined(OVERRIDE_HOST_CACHE_LINE_SIZE)
+inline constexpr u32 HOST_CACHE_LINE_SIZE = OVERRIDE_HOST_CACHE_LINE_SIZE;
+#elif defined(__APPLE__) && defined(__aarch64__)
+inline constexpr u32 HOST_CACHE_LINE_SIZE = 128; // Apple Silicon uses 128b cache lines.
+#else
+inline constexpr u32 HOST_CACHE_LINE_SIZE = 64; // Everything else is 64b.
+#endif
+#define ALIGN_TO_CACHE_LINE alignas(HOST_CACHE_LINE_SIZE)
 
 // Enum class bitwise operators
 #define IMPLEMENT_ENUM_CLASS_BITWISE_OPERATORS(type_)                                                                  \
@@ -219,3 +281,6 @@ static constexpr u32 HOST_PAGE_SHIFT = 12;
                              static_cast<std::underlying_type<type_>::type>(rhs));                                     \
     return lhs;                                                                                                        \
   }
+
+// Compute the address of a base type given a field offset.
+#define BASE_FROM_RECORD_FIELD(ptr, base_type, field) ((base_type*)(((char*)ptr) - offsetof(base_type, field)))

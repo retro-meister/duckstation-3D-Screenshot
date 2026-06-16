@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2019-2022 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 #include <QtCore/QVector>
@@ -18,41 +18,13 @@ public:
   ~AdvancedSettingsWidget();
 
 private:
-  struct TweakOption
-  {
-    enum class Type
-    {
-      Boolean,
-      IntRange
-    };
-
-    Type type;
-    QString description;
-    std::string key;
-    std::string section;
-
-    union
-    {
-      struct
-      {
-        bool default_value;
-      } boolean;
-
-      struct
-      {
-        int min_value;
-        int max_value;
-        int default_value;
-      } int_range;
-    };
-  };
+  void onLogChannelsButtonClicked();
+  void onAnyLogSinksChanged();
+  void onShowDebugOptionsStateChanged();
+  void refreshWebCacheSize();
+  void onClearWebCacheClicked();
 
   SettingsWindow* m_dialog;
 
   Ui::AdvancedSettingsWidget m_ui;
-
-  QVector<TweakOption> m_tweak_options;
-
-  void addTweakOptions();
-  void onResetToDefaultClicked();
 };

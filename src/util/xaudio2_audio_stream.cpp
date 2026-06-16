@@ -1,280 +1,314 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
-#include "util/audio_stream.h"
+#include "audio_stream.h"
+#include "translation.h"
 
 #include "common/assert.h"
+#include "common/dynamic_library.h"
+#include "common/error.h"
+#include "common/heap_array.h"
 #include "common/log.h"
-#include "common/windows_headers.h"
+#include "common/string_util.h"
 
 #include <array>
-#include <cstdint>
-#include <memory>
+#include <atomic>
+#include <vector>
+
+#include "common/windows_headers.h"
+
+#include <mmdeviceapi.h> // must be included before functiondiscoverykeys_devpkey.h
+
+#include <devpkey.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <propsys.h>
 #include <wrl/client.h>
 #include <xaudio2.h>
 
-Log_SetChannel(XAudio2AudioStream);
+LOG_CHANNEL(AudioStream);
 
 namespace {
+
+static constexpr u32 NUM_BUFFERS = 2;
 
 class XAudio2AudioStream final : public AudioStream, private IXAudio2VoiceCallback
 {
 public:
-  XAudio2AudioStream(u32 sample_rate, u32 channels, u32 buffer_ms, AudioStretchMode stretch);
-  ~XAudio2AudioStream();
+  XAudio2AudioStream(AudioStreamSource* source, u32 channels);
+  ~XAudio2AudioStream() override;
 
-  void SetPaused(bool paused) override;
-  void SetOutputVolume(u32 volume) override;
+  bool Initialize(u32 sample_rate, u32 channels, u32 output_latency_frames, bool output_latency_minimal,
+                  std::string_view device_name, bool auto_start, Error* error);
 
-  bool OpenDevice(u32 latency_ms);
-  void CloseDevice();
-  void EnqueueBuffer();
+  bool Start(Error* error) override;
+  bool Stop(Error* error) override;
 
 private:
-  enum : u32
-  {
-    NUM_BUFFERS = 2,
-    INTERNAL_BUFFER_SIZE = 512,
-  };
+  s16* GetBufferPointer(u32 buffer_index);
 
-  ALWAYS_INLINE bool IsOpen() const { return static_cast<bool>(m_xaudio); }
+  // IXAudio2VoiceCallback — only OnBufferEnd needs a body
+  void STDMETHODCALLTYPE OnVoiceProcessingPassStart(UINT32 BytesRequired) override {}
+  void STDMETHODCALLTYPE OnVoiceProcessingPassEnd() override {}
+  void STDMETHODCALLTYPE OnStreamEnd() override {}
+  void STDMETHODCALLTYPE OnBufferStart(void* pBufferContext) override {}
+  void STDMETHODCALLTYPE OnBufferEnd(void* pBufferContext) override;
+  void STDMETHODCALLTYPE OnLoopEnd(void* pBufferContext) override {}
+  void STDMETHODCALLTYPE OnVoiceError(void* pBufferContext, HRESULT Error) override {}
 
-  // Inherited via IXAudio2VoiceCallback
-  void __stdcall OnVoiceProcessingPassStart(UINT32 BytesRequired) override;
-  void __stdcall OnVoiceProcessingPassEnd(void) override;
-  void __stdcall OnStreamEnd(void) override;
-  void __stdcall OnBufferStart(void* pBufferContext) override;
-  void __stdcall OnBufferEnd(void* pBufferContext) override;
-  void __stdcall OnLoopEnd(void* pBufferContext) override;
-  void __stdcall OnVoiceError(void* pBufferContext, HRESULT Error) override;
+  AudioStreamSource* m_source;
+  u32 m_buffer_frames = 0;
+  u32 m_channels;
 
-  Microsoft::WRL::ComPtr<IXAudio2> m_xaudio;
+  DynamicLibrary m_library;
+
+  Microsoft::WRL::ComPtr<IXAudio2> m_xaudio2;
   IXAudio2MasteringVoice* m_mastering_voice = nullptr;
   IXAudio2SourceVoice* m_source_voice = nullptr;
 
-  std::array<std::unique_ptr<SampleType[]>, NUM_BUFFERS> m_enqueue_buffers;
-  u32 m_enqueue_buffer_size = 0;
-  u32 m_current_buffer = 0;
-  bool m_buffer_enqueued = false;
-
-  HMODULE m_xaudio2_library = {};
-  bool m_com_initialized_by_us = false;
+  DynamicHeapArray<s16> m_buffer;
+  std::atomic_bool m_shutting_down{false};
 };
 
 } // namespace
 
-XAudio2AudioStream::XAudio2AudioStream(u32 sample_rate, u32 channels, u32 buffer_ms, AudioStretchMode stretch)
-  : AudioStream(sample_rate, channels, buffer_ms, stretch)
+XAudio2AudioStream::XAudio2AudioStream(AudioStreamSource* source, u32 channels) : m_source(source), m_channels(channels)
 {
 }
 
 XAudio2AudioStream::~XAudio2AudioStream()
 {
-  if (IsOpen())
-    CloseDevice();
+  if (m_source_voice)
+  {
+    m_shutting_down.store(true, std::memory_order_release);
 
-  if (m_xaudio2_library)
-    FreeLibrary(m_xaudio2_library);
+    m_source_voice->Stop(0);
+    m_source_voice->FlushSourceBuffers();
+    m_source_voice->DestroyVoice();
+    m_source_voice = nullptr;
+  }
 
-  if (m_com_initialized_by_us)
-    CoUninitialize();
+  if (m_mastering_voice)
+  {
+    m_mastering_voice->DestroyVoice();
+    m_mastering_voice = nullptr;
+  }
+
+  m_xaudio2.Reset();
 }
 
-std::unique_ptr<AudioStream> AudioStream::CreateXAudio2Stream(u32 sample_rate, u32 channels, u32 buffer_ms,
-                                                              u32 latency_ms, AudioStretchMode stretch)
+bool XAudio2AudioStream::Initialize(u32 sample_rate, u32 channels, u32 output_latency_frames,
+                                    bool output_latency_minimal, std::string_view device_name, bool auto_start,
+                                    Error* error)
 {
-  std::unique_ptr<XAudio2AudioStream> stream(
-    std::make_unique<XAudio2AudioStream>(sample_rate, channels, buffer_ms, stretch));
-  if (!stream->OpenDevice(latency_ms))
-    stream.reset();
-  return stream;
-}
+  if (!m_library.IsOpen() && !m_library.Open(XAUDIO2_DLL_A, error))
+    return false;
 
-bool XAudio2AudioStream::OpenDevice(u32 latency_ms)
-{
-  DebugAssert(!IsOpen());
-
-  m_xaudio2_library = LoadLibraryW(XAUDIO2_DLL_W);
-  if (!m_xaudio2_library)
+  HRESULT(WINAPI * pXAudio2Create)(IXAudio2**, UINT32, XAUDIO2_PROCESSOR);
+  if (!m_library.GetSymbol("XAudio2Create", &pXAudio2Create))
   {
-    Log_ErrorPrintf("Failed to load '%s', make sure you're using Windows 10", XAUDIO2_DLL_A);
+    Error::SetWin32(error, "Failed to get XAudio2Create function: ", GetLastError());
     return false;
   }
 
-  using PFNXAUDIO2CREATE =
-    HRESULT(STDAPICALLTYPE*)(IXAudio2 * *ppXAudio2, UINT32 Flags, XAUDIO2_PROCESSOR XAudio2Processor);
-  PFNXAUDIO2CREATE xaudio2_create =
-    reinterpret_cast<PFNXAUDIO2CREATE>(GetProcAddress(m_xaudio2_library, "XAudio2Create"));
-  if (!xaudio2_create)
-    return false;
-
-  HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-  m_com_initialized_by_us = SUCCEEDED(hr);
-  if (FAILED(hr) && hr != RPC_E_CHANGED_MODE && hr != S_FALSE)
-  {
-    Log_ErrorPrintf("Failed to initialize COM");
-    return false;
-  }
-
-  hr = xaudio2_create(m_xaudio.ReleaseAndGetAddressOf(), 0, XAUDIO2_DEFAULT_PROCESSOR);
+  HRESULT hr = pXAudio2Create(m_xaudio2.GetAddressOf(), 0, XAUDIO2_DEFAULT_PROCESSOR);
   if (FAILED(hr))
   {
-    Log_ErrorPrintf("XAudio2Create() failed: %08X", hr);
+    Error::SetHResult(error, "XAudio2Create() failed: ", hr);
     return false;
   }
 
-  hr = m_xaudio->CreateMasteringVoice(&m_mastering_voice, m_channels, m_sample_rate, 0, nullptr);
+  // Convert optional device name from UTF-8 to wide for CreateMasteringVoice.
+  std::wstring device_id;
+  if (!device_name.empty())
+    device_id = StringUtil::UTF8StringToWideString(device_name);
+
+  hr = m_xaudio2->CreateMasteringVoice(&m_mastering_voice, channels, sample_rate, 0,
+                                       device_id.empty() ? nullptr : device_id.c_str());
   if (FAILED(hr))
   {
-    Log_ErrorPrintf("CreateMasteringVoice() failed: %08X", hr);
-    return false;
+    if (!device_name.empty())
+    {
+      // Try with the default device if a specific one was requested, in case the requested device
+      // is invalid or unavailable.
+      ERROR_LOG("IXAudio2::CreateMasteringVoice() for specific device failed: {:08X}", static_cast<unsigned>(hr));
+      hr = m_xaudio2->CreateMasteringVoice(&m_mastering_voice, channels, sample_rate, 0, nullptr);
+      if (SUCCEEDED(hr))
+      {
+        WARNING_LOG("IXAudio2::CreateMasteringVoice() succeeded with default device after specific device failed, "
+                    "ignoring requested device '{}'",
+                    device_name);
+      }
+    }
+
+    if (FAILED(hr))
+    {
+      Error::SetHResult(error, "IXAudio2::CreateMasteringVoice() failed: ", hr);
+      return false;
+    }
   }
 
-  WAVEFORMATEX wf = {};
-  wf.cbSize = sizeof(wf);
-  wf.nAvgBytesPerSec = m_sample_rate * m_channels * sizeof(s16);
-  wf.nBlockAlign = static_cast<WORD>(sizeof(s16) * m_channels);
-  wf.nChannels = static_cast<WORD>(m_channels);
-  wf.nSamplesPerSec = m_sample_rate;
-  wf.wBitsPerSample = sizeof(s16) * 8;
-  wf.wFormatTag = WAVE_FORMAT_PCM;
-  hr = m_xaudio->CreateSourceVoice(&m_source_voice, &wf, 0, 1.0f, this);
+  WAVEFORMATEX wfx = {};
+  wfx.wFormatTag = WAVE_FORMAT_PCM;
+  wfx.nChannels = static_cast<WORD>(channels);
+  wfx.nSamplesPerSec = sample_rate;
+  wfx.wBitsPerSample = 16;
+  wfx.nBlockAlign = static_cast<WORD>((channels * 16) / 8);
+  wfx.nAvgBytesPerSec = sample_rate * wfx.nBlockAlign;
+  wfx.cbSize = 0;
+
+  hr = m_xaudio2->CreateSourceVoice(&m_source_voice, &wfx, 0, 1.0f, this);
   if (FAILED(hr))
   {
-    Log_ErrorPrintf("CreateMasteringVoice() failed: %08X", hr);
+    Error::SetHResult(error, "IXAudio2::CreateSourceVoice() failed: ", hr);
     return false;
   }
 
-  hr = m_source_voice->SetFrequencyRatio(1.0f);
-  if (FAILED(hr))
-  {
-    Log_ErrorPrintf("SetFrequencyRatio() failed: %08X", hr);
-    return false;
-  }
+  m_buffer_frames = output_latency_frames;
+  m_buffer.resize(NUM_BUFFERS * m_buffer_frames * channels);
 
-  m_enqueue_buffer_size = std::max<u32>(INTERNAL_BUFFER_SIZE, GetBufferSizeForMS(m_sample_rate, latency_ms));
-  Log_DevPrintf("Allocating %u buffers of %u frames", NUM_BUFFERS, m_enqueue_buffer_size);
+  // Pre-fill with a single frame buffers and enqueue them so playback can begin immediately.
   for (u32 i = 0; i < NUM_BUFFERS; i++)
-    m_enqueue_buffers[i] = std::make_unique<SampleType[]>(m_enqueue_buffer_size * m_channels);
-
-  BaseInitialize();
-  m_volume = 100;
-  m_paused = false;
-
-  hr = m_source_voice->Start(0, 0);
-  if (FAILED(hr))
   {
-    Log_ErrorPrintf("Start() failed: %08X", hr);
-    return false;
+    XAUDIO2_BUFFER buffer = {};
+    buffer.AudioBytes = sizeof(s16) * channels;
+    buffer.pAudioData = reinterpret_cast<const BYTE*>(GetBufferPointer(i));
+    buffer.pContext = reinterpret_cast<void*>(static_cast<uintptr_t>(i));
+
+    hr = m_source_voice->SubmitSourceBuffer(&buffer);
+    if (FAILED(hr))
+    {
+      Error::SetHResult(error, "IXAudio2SourceVoice::SubmitSourceBuffer() failed: ", hr);
+      return false;
+    }
   }
 
-  EnqueueBuffer();
+  if (auto_start)
+  {
+    hr = m_source_voice->Start(0);
+    if (FAILED(hr))
+    {
+      Error::SetHResult(error, "IXAudio2SourceVoice::Start() failed: ", hr);
+      return false;
+    }
+  }
+
+  INFO_LOG("XAudio2 stream initialized: {}hz, {} channels, {} frames/buffer ({} ms)", sample_rate, channels,
+           output_latency_frames, FramesToMS(sample_rate, output_latency_frames));
   return true;
 }
 
-void XAudio2AudioStream::SetPaused(bool paused)
+s16* XAudio2AudioStream::GetBufferPointer(u32 buffer_index)
 {
-  if (m_paused == paused)
+  DebugAssert(((buffer_index * (m_channels * m_buffer_frames)) + m_buffer_frames) <= m_buffer.size());
+  return &m_buffer[buffer_index * (m_channels * m_buffer_frames)];
+}
+
+void XAudio2AudioStream::OnBufferEnd(void* pBufferContext)
+{
+  if (m_shutting_down.load(std::memory_order_acquire))
     return;
+  const u32 buffer_idx = static_cast<u32>(reinterpret_cast<uintptr_t>(pBufferContext));
+  s16* const buffer_ptr = GetBufferPointer(buffer_idx);
+  m_source->ReadFrames(buffer_ptr, m_buffer_frames);
 
-  if (paused)
-  {
-    HRESULT hr = m_source_voice->Stop(0, 0);
-    if (FAILED(hr))
-      Log_ErrorPrintf("Stop() failed: %08X", hr);
-  }
-  else
-  {
-    HRESULT hr = m_source_voice->Start(0, 0);
-    if (FAILED(hr))
-      Log_ErrorPrintf("Start() failed: %08X", hr);
-  }
-
-  m_paused = paused;
-
-  if (!m_buffer_enqueued)
-    EnqueueBuffer();
+  XAUDIO2_BUFFER buffer = {};
+  buffer.AudioBytes = static_cast<UINT32>(m_buffer_frames * m_channels * sizeof(s16));
+  buffer.pAudioData = reinterpret_cast<const BYTE*>(buffer_ptr);
+  buffer.pContext = pBufferContext;
+  m_source_voice->SubmitSourceBuffer(&buffer);
 }
 
-void XAudio2AudioStream::CloseDevice()
+bool XAudio2AudioStream::Start(Error* error)
 {
-  HRESULT hr;
-  if (!m_paused)
-  {
-    hr = m_source_voice->Stop(0, 0);
-    if (FAILED(hr))
-      Log_ErrorPrintf("Stop() failed: %08X", hr);
-  }
-
-  m_source_voice = nullptr;
-  m_mastering_voice = nullptr;
-  m_xaudio.Reset();
-  m_enqueue_buffers = {};
-  m_current_buffer = 0;
-  m_paused = true;
-}
-
-void XAudio2AudioStream::EnqueueBuffer()
-{
-  SampleType* samples = m_enqueue_buffers[m_current_buffer].get();
-  ReadFrames(samples, m_enqueue_buffer_size);
-
-  const XAUDIO2_BUFFER buf = {
-    static_cast<UINT32>(0),                                                // flags
-    static_cast<UINT32>(sizeof(s16) * m_channels * m_enqueue_buffer_size), // bytes
-    reinterpret_cast<const BYTE*>(samples),                                // data
-    0u,
-    0u,
-    0u,
-    0u,
-    0u,
-    nullptr,
-  };
-
-  HRESULT hr = m_source_voice->SubmitSourceBuffer(&buf, nullptr);
-  if (FAILED(hr))
-    Log_ErrorPrintf("SubmitSourceBuffer() failed: %08X", hr);
-
-  m_current_buffer = (m_current_buffer + 1) % NUM_BUFFERS;
-}
-
-void XAudio2AudioStream::SetOutputVolume(u32 volume)
-{
-  HRESULT hr = m_mastering_voice->SetVolume(static_cast<float>(m_volume) / 100.0f);
+  const HRESULT hr = m_source_voice->Start(0);
   if (FAILED(hr))
   {
-    Log_ErrorPrintf("SetVolume() failed: %08X", hr);
-    return;
+    Error::SetHResult(error, "IXAudio2SourceVoice::Start() failed: ", hr);
+    return false;
   }
 
-  m_volume = volume;
+  return true;
 }
 
-void __stdcall XAudio2AudioStream::OnVoiceProcessingPassStart(UINT32 BytesRequired)
+bool XAudio2AudioStream::Stop(Error* error)
 {
+  const HRESULT hr = m_source_voice->Stop(0);
+  if (FAILED(hr))
+  {
+    Error::SetHResult(error, "IXAudio2SourceVoice::Stop() failed: ", hr);
+    return false;
+  }
+
+  return true;
 }
 
-void __stdcall XAudio2AudioStream::OnVoiceProcessingPassEnd(void)
+std::vector<AudioStream::DeviceInfo> AudioStream::GetXAudio2OutputDevices(u32 sample_rate)
 {
+  std::vector<AudioStream::DeviceInfo> ret;
+  ret.emplace_back(std::string(), TRANSLATE_STR("AudioStream", "Default"), 0);
+
+  Microsoft::WRL::ComPtr<IMMDeviceEnumerator> enumerator;
+  HRESULT hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_INPROC_SERVER,
+                                __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(enumerator.GetAddressOf()));
+  if (FAILED(hr))
+  {
+    WARNING_LOG("CoCreateInstance(IMMDeviceEnumerator) failed: {:08X}", static_cast<unsigned>(hr));
+    return ret;
+  }
+
+  Microsoft::WRL::ComPtr<IMMDeviceCollection> devices;
+  hr = enumerator->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, devices.GetAddressOf());
+  if (FAILED(hr))
+  {
+    WARNING_LOG("IMMDeviceEnumerator::EnumAudioEndpoints() failed: {:08X}", static_cast<unsigned>(hr));
+    return ret;
+  }
+
+  UINT count = 0;
+  devices->GetCount(&count);
+
+  for (UINT i = 0; i < count; i++)
+  {
+    Microsoft::WRL::ComPtr<IMMDevice> device;
+    if (FAILED(devices->Item(i, device.GetAddressOf())))
+      continue;
+
+    // The WASAPI device ID is what XAudio2 expects for CreateMasteringVoice.
+    LPWSTR device_id_wide = nullptr;
+    if (FAILED(device->GetId(&device_id_wide)))
+      continue;
+
+    std::string device_id = StringUtil::WideStringToUTF8String(device_id_wide);
+    CoTaskMemFree(device_id_wide);
+
+    std::string friendly_name;
+    Microsoft::WRL::ComPtr<IPropertyStore> props;
+    if (SUCCEEDED(device->OpenPropertyStore(STGM_READ, props.GetAddressOf())))
+    {
+      PROPVARIANT pv;
+      PropVariantInit(&pv);
+      if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR)
+        friendly_name = StringUtil::WideStringToUTF8String(pv.pwszVal);
+      PropVariantClear(&pv);
+    }
+
+    ret.emplace_back(std::move(device_id), friendly_name.empty() ? ret.back().name : std::move(friendly_name), 0);
+  }
+
+  return ret;
 }
 
-void __stdcall XAudio2AudioStream::OnStreamEnd(void)
+std::unique_ptr<AudioStream>
+AudioStream::CreateXAudio2AudioStream(u32 sample_rate, u32 channels, u32 output_latency_frames,
+                                      bool output_latency_minimal, std::string_view device_name,
+                                      AudioStreamSource* source, bool auto_start, Error* error)
 {
-}
+  std::unique_ptr<XAudio2AudioStream> stream = std::make_unique<XAudio2AudioStream>(source, channels);
+  if (!stream->Initialize(sample_rate, channels, output_latency_frames, output_latency_minimal, device_name, auto_start,
+                          error))
+  {
+    stream.reset();
+  }
 
-void __stdcall XAudio2AudioStream::OnBufferStart(void* pBufferContext)
-{
-}
-
-void __stdcall XAudio2AudioStream::OnBufferEnd(void* pBufferContext)
-{
-  EnqueueBuffer();
-}
-
-void __stdcall XAudio2AudioStream::OnLoopEnd(void* pBufferContext)
-{
-}
-
-void __stdcall XAudio2AudioStream::OnVoiceError(void* pBufferContext, HRESULT Error)
-{
+  return stream;
 }

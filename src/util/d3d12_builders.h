@@ -1,15 +1,19 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 
 #include "common/types.h"
 #include "common/windows_headers.h"
 
+#include "gpu_device.h"
+
 #include <array>
 #include <d3d12.h>
 #include <string_view>
 #include <wrl/client.h>
+
+class Error;
 
 namespace D3D12 {
 class RootSignatureBuilder
@@ -18,14 +22,15 @@ public:
   enum : u32
   {
     MAX_PARAMETERS = 16,
-    MAX_DESCRIPTOR_RANGES = 16
+    MAX_DESCRIPTOR_RANGES = 16,
+    MAX_STATIC_SAMPLERS = 1,
   };
 
   RootSignatureBuilder();
 
   void Clear();
 
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> Create(bool clear = true);
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> Create(Error* error, bool clear);
 
   void SetInputAssemblerFlag();
 
@@ -34,11 +39,13 @@ public:
   u32 AddSRVParameter(u32 shader_reg, D3D12_SHADER_VISIBILITY visibility);
   u32 AddDescriptorTable(D3D12_DESCRIPTOR_RANGE_TYPE rt, u32 start_shader_reg, u32 num_shader_regs,
                          D3D12_SHADER_VISIBILITY visibility);
+  u32 AddStaticSampler(u32 shader_reg, const D3D12_SAMPLER_DESC& sampler_desc, D3D12_SHADER_VISIBILITY visibility);
 
 private:
   D3D12_ROOT_SIGNATURE_DESC m_desc{};
   std::array<D3D12_ROOT_PARAMETER, MAX_PARAMETERS> m_params{};
   std::array<D3D12_DESCRIPTOR_RANGE, MAX_DESCRIPTOR_RANGES> m_descriptor_ranges{};
+  std::array<D3D12_STATIC_SAMPLER_DESC, MAX_STATIC_SAMPLERS> m_static_samplers{};
   u32 m_num_descriptor_ranges = 0;
 };
 
@@ -58,7 +65,7 @@ public:
 
   void Clear();
 
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> Create(ID3D12Device* device, bool clear = true);
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> Create(ID3D12Device* device, Error* error, bool clear);
 
   void SetRootSignature(ID3D12RootSignature* rs);
 
@@ -78,21 +85,14 @@ public:
 
   void SetMultisamples(u32 multisamples);
 
-  void SetNoCullRasterizationState();
-
   void SetDepthState(bool depth_test, bool depth_write, D3D12_COMPARISON_FUNC compare_op);
   void SetStencilState(bool stencil_test, u8 read_mask, u8 write_mask, const D3D12_DEPTH_STENCILOP_DESC& front,
                        const D3D12_DEPTH_STENCILOP_DESC& back);
-
-  void SetNoDepthTestState();
   void SetNoStencilState();
 
   void SetBlendState(u32 rt, bool blend_enable, D3D12_BLEND src_factor, D3D12_BLEND dst_factor, D3D12_BLEND_OP op,
                      D3D12_BLEND alpha_src_factor, D3D12_BLEND alpha_dst_factor, D3D12_BLEND_OP alpha_op,
                      u8 write_mask = D3D12_COLOR_WRITE_ENABLE_ALL);
-  void SetColorWriteMask(u32 rt, u8 write_mask = D3D12_COLOR_WRITE_ENABLE_ALL);
-
-  void SetNoBlendingState();
 
   void ClearRenderTargets();
 
@@ -113,9 +113,11 @@ public:
   ComputePipelineBuilder();
   ~ComputePipelineBuilder() = default;
 
+  ALWAYS_INLINE const D3D12_COMPUTE_PIPELINE_STATE_DESC* GetDesc() const { return &m_desc; }
+
   void Clear();
 
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> Create(ID3D12Device* device, bool clear = true);
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> Create(ID3D12Device* device, Error* error, bool clear);
 
   void SetRootSignature(ID3D12RootSignature* rs);
 
@@ -125,14 +127,10 @@ private:
   D3D12_COMPUTE_PIPELINE_STATE_DESC m_desc;
 };
 
-#ifdef _DEBUG
-void SetObjectName(ID3D12Object* object, const std::string_view& name);
-void SetObjectNameFormatted(ID3D12Object* object, const char* format, ...);
+#ifdef ENABLE_GPU_OBJECT_NAMES
+void SetObjectName(ID3D12Object* object, std::string_view name);
 #else
-static inline void SetObjectName(ID3D12Object* object, const std::string_view& name)
-{
-}
-static inline void SetObjectNameFormatted(ID3D12Object* object, const char* format, ...)
+inline void SetObjectName(ID3D12Object* object, std::string_view name)
 {
 }
 #endif

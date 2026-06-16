@@ -1,28 +1,49 @@
-// SPDX-FileCopyrightText: 2019-2022 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 
 #include "util/imgui_manager.h"
 
+#include <string>
+
+class SettingsInterface;
+
+class GPUBackend;
+
 namespace ImGuiManager {
-void RenderTextOverlays();
+
+inline constexpr const char* LOGO_IMAGE_NAME = "images/duck.png";
+
+void UpdateInputOverlay();
+void RenderTextOverlays(const GPUBackend* gpu);
+bool AreAnyDebugWindowsEnabled(const SettingsInterface& si);
+bool IsSPUDebugWindowEnabled();
 void RenderDebugWindows();
+bool UpdateDebugWindowConfig();
+void DestroyAllDebugWindows();
+
 void RenderOverlayWindows();
+void DestroyOverlayTextures();
+
 } // namespace ImGuiManager
 
 namespace SaveStateSelectorUI {
 
-static constexpr float DEFAULT_OPEN_TIME = 5.0f;
+inline constexpr float DEFAULT_OPEN_TIME = 7.5f;
 
+bool IsOpen();
 void Open(float open_time = DEFAULT_OPEN_TIME);
 void RefreshList();
-void DestroyTextures();
-void Close(bool reset_slot = false);
+void Clear();
+void ClearList();
+void Close();
 
-void SelectNextSlot();
-void SelectPreviousSlot();
+void SelectNextSlot(bool open_selector);
+void SelectPreviousSlot(bool open_selector);
 
+s32 GetCurrentSlot();
+bool IsCurrentSlotGlobal();
 void LoadCurrentSlot();
 void SaveCurrentSlot();
 

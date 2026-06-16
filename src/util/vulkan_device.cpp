@@ -1,8 +1,9 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "vulkan_device.h"
 #include "vulkan_builders.h"
+#include "vulkan_loader.h"
 #include "vulkan_pipeline.h"
 #include "vulkan_stream_buffer.h"
 #include "vulkan_swap_chain.h"
@@ -13,18 +14,22 @@
 #include "common/align.h"
 #include "common/assert.h"
 #include "common/bitutils.h"
+#include "common/error.h"
 #include "common/file_system.h"
+#include "common/heap_array.h"
 #include "common/log.h"
 #include "common/path.h"
 #include "common/scoped_guard.h"
 #include "common/small_string.h"
 
 #include "fmt/format.h"
+#include "xxhash.h"
 
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 
-Log_SetChannel(VulkanDevice);
+LOG_CHANNEL(GPUDevice);
 
 // TODO: VK_KHR_display.
 
@@ -39,11 +44,19 @@ struct VK_PIPELINE_CACHE_HEADER
 };
 #pragma pack(pop)
 
+static VkAttachmentLoadOp GetLoadOpForTexture(const GPUTexture* tex)
+{
+  static constexpr VkAttachmentLoadOp ops[3] = {VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                                VK_ATTACHMENT_LOAD_OP_DONT_CARE};
+  return ops[static_cast<u8>(tex->GetState())];
+}
+
 // Tweakables
 enum : u32
 {
   MAX_DRAW_CALLS_PER_FRAME = 2048,
   MAX_COMBINED_IMAGE_SAMPLER_DESCRIPTORS_PER_FRAME = GPUDevice::MAX_TEXTURE_SAMPLERS * MAX_DRAW_CALLS_PER_FRAME,
+  MAX_INPUT_ATTACHMENT_DESCRIPTORS_PER_FRAME = MAX_DRAW_CALLS_PER_FRAME,
   MAX_DESCRIPTOR_SETS_PER_FRAME = MAX_DRAW_CALLS_PER_FRAME,
   MAX_SAMPLER_DESCRIPTORS = 8192,
 
@@ -59,15 +72,21 @@ enum : u32
   MAX_UNIFORM_BUFFER_SIZE = 1024,
 };
 
-const std::array<VkFormat, static_cast<u32>(GPUTexture::Format::MaxCount)> VulkanDevice::TEXTURE_FORMAT_MAPPING = {
+const std::array<VkFormat, static_cast<u32>(GPUTextureFormat::MaxCount)> VulkanDevice::TEXTURE_FORMAT_MAPPING = {
   VK_FORMAT_UNDEFINED,                // Unknown
   VK_FORMAT_R8G8B8A8_UNORM,           // RGBA8
   VK_FORMAT_B8G8R8A8_UNORM,           // BGRA8
   VK_FORMAT_R5G6B5_UNORM_PACK16,      // RGB565
-  VK_FORMAT_R5G5B5A1_UNORM_PACK16,    // RGBA5551
+  VK_FORMAT_A1R5G5B5_UNORM_PACK16,    // RGB5A1
+  VK_FORMAT_R5G5B5A1_UNORM_PACK16,    // A1BGR5
   VK_FORMAT_R8_UNORM,                 // R8
   VK_FORMAT_D16_UNORM,                // D16
+  VK_FORMAT_D24_UNORM_S8_UINT,        // D24S8
+  VK_FORMAT_D32_SFLOAT,               // D32F
+  VK_FORMAT_D32_SFLOAT_S8_UINT,       // D32FS8
   VK_FORMAT_R16_UNORM,                // R16
+  VK_FORMAT_R16_SINT,                 // R16I
+  VK_FORMAT_R16_UINT,                 // R16U
   VK_FORMAT_R16_SFLOAT,               // R16F
   VK_FORMAT_R32_SINT,                 // R32I
   VK_FORMAT_R32_UINT,                 // R32U
@@ -80,20 +99,25 @@ const std::array<VkFormat, static_cast<u32>(GPUTexture::Format::MaxCount)> Vulka
   VK_FORMAT_R16G16B16A16_SFLOAT,      // RGBA16F
   VK_FORMAT_R32G32B32A32_SFLOAT,      // RGBA32F
   VK_FORMAT_A2R10G10B10_UNORM_PACK32, // RGB10A2
+  VK_FORMAT_R8G8B8A8_SRGB,            // SRGBA8
+  VK_FORMAT_BC1_RGBA_UNORM_BLOCK,     // BC1
+  VK_FORMAT_BC2_UNORM_BLOCK,          // BC2
+  VK_FORMAT_BC3_UNORM_BLOCK,          // BC3
+  VK_FORMAT_BC7_UNORM_BLOCK,          // BC7
 };
 
-static constexpr VkClearValue s_present_clear_color = {{{0.0f, 0.0f, 0.0f, 1.0f}}};
+// Handles are always 64-bit, even on 32-bit platforms.
+static const VkRenderPass DYNAMIC_RENDERING_RENDER_PASS = ((VkRenderPass) static_cast<s64>(-1LL));
 
-#ifdef _DEBUG
+#ifdef ENABLE_GPU_OBJECT_NAMES
 static u32 s_debug_scope_depth = 0;
 #endif
 
-// We need to synchronize instance creation because of adapter enumeration from the UI thread.
-static std::mutex s_instance_mutex;
-
 VulkanDevice::VulkanDevice()
 {
-#ifdef _DEBUG
+  m_render_api = RenderAPI::Vulkan;
+
+#ifdef ENABLE_GPU_OBJECT_NAMES
   s_debug_scope_depth = 0;
 #endif
 }
@@ -103,299 +127,322 @@ VulkanDevice::~VulkanDevice()
   Assert(m_device == VK_NULL_HANDLE);
 }
 
-GPUTexture::Format VulkanDevice::GetFormatForVkFormat(VkFormat format)
+GPUTextureFormat VulkanDevice::GetFormatForVkFormat(VkFormat format)
 {
   for (u32 i = 0; i < static_cast<u32>(std::size(TEXTURE_FORMAT_MAPPING)); i++)
   {
     if (TEXTURE_FORMAT_MAPPING[i] == format)
-      return static_cast<GPUTexture::Format>(i);
+      return static_cast<GPUTextureFormat>(i);
   }
 
-  return GPUTexture::Format::Unknown;
+  return GPUTextureFormat::Unknown;
 }
 
-VkInstance VulkanDevice::CreateVulkanInstance(const WindowInfo& wi, bool enable_debug_utils,
-                                              bool enable_validation_layer)
+bool VulkanDevice::EnableOptionalDeviceExtensions(VkPhysicalDevice physical_device,
+                                                  std::span<const VkExtensionProperties> available_extensions,
+                                                  ExtensionList& enabled_extensions,
+                                                  VkPhysicalDeviceFeatures& enabled_features, bool enable_surface,
+                                                  Error* error)
 {
-  ExtensionList enabled_extensions;
-  if (!SelectInstanceExtensions(&enabled_extensions, wi, enable_debug_utils))
-    return VK_NULL_HANDLE;
-
-  // Remember to manually update this every release. We don't pull in svnrev.h here, because
-  // it's only the major/minor version, and rebuilding the file every time something else changes
-  // is unnecessary.
-  VkApplicationInfo app_info = {};
-  app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-  app_info.pNext = nullptr;
-  app_info.pApplicationName = "DuckStation";
-  app_info.applicationVersion = VK_MAKE_VERSION(0, 1, 0);
-  app_info.pEngineName = "DuckStation";
-  app_info.engineVersion = VK_MAKE_VERSION(0, 1, 0);
-  app_info.apiVersion = VK_API_VERSION_1_1;
-
-  VkInstanceCreateInfo instance_create_info = {};
-  instance_create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-  instance_create_info.pNext = nullptr;
-  instance_create_info.flags = 0;
-  instance_create_info.pApplicationInfo = &app_info;
-  instance_create_info.enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size());
-  instance_create_info.ppEnabledExtensionNames = enabled_extensions.data();
-  instance_create_info.enabledLayerCount = 0;
-  instance_create_info.ppEnabledLayerNames = nullptr;
-
-  // Enable debug layer on debug builds
-  if (enable_validation_layer)
-  {
-    static const char* layer_names[] = {"VK_LAYER_KHRONOS_validation"};
-    instance_create_info.enabledLayerCount = 1;
-    instance_create_info.ppEnabledLayerNames = layer_names;
-  }
-
-  VkInstance instance;
-  VkResult res = vkCreateInstance(&instance_create_info, nullptr, &instance);
-  if (res != VK_SUCCESS)
-  {
-    LOG_VULKAN_ERROR(res, "vkCreateInstance failed: ");
-    return nullptr;
-  }
-
-  return instance;
-}
-
-bool VulkanDevice::SelectInstanceExtensions(ExtensionList* extension_list, const WindowInfo& wi,
-                                            bool enable_debug_utils)
-{
-  u32 extension_count = 0;
-  VkResult res = vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr);
-  if (res != VK_SUCCESS)
-  {
-    LOG_VULKAN_ERROR(res, "vkEnumerateInstanceExtensionProperties failed: ");
-    return false;
-  }
-
-  if (extension_count == 0)
-  {
-    Log_ErrorPrintf("Vulkan: No extensions supported by instance.");
-    return false;
-  }
-
-  std::vector<VkExtensionProperties> available_extension_list(extension_count);
-  res = vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, available_extension_list.data());
-  DebugAssert(res == VK_SUCCESS);
-
-  auto SupportsExtension = [&](const char* name, bool required) {
-    if (std::find_if(available_extension_list.begin(), available_extension_list.end(),
-                     [&](const VkExtensionProperties& properties) {
-                       return !strcmp(name, properties.extensionName);
-                     }) != available_extension_list.end())
-    {
-      Log_DevPrintf("Enabling extension: %s", name);
-      extension_list->push_back(name);
-      return true;
-    }
-
-    if (required)
-      Log_ErrorPrintf("Vulkan: Missing required extension %s.", name);
-
-    return false;
+  const auto SupportsExtension = [&available_extensions](const char* name) {
+    return (std::find_if(available_extensions.begin(), available_extensions.end(),
+                         [&](const VkExtensionProperties& properties) {
+                           return (std::strcmp(name, properties.extensionName) == 0);
+                         }) != available_extensions.end());
   };
 
-  // Common extensions
-  if (wi.type != WindowInfo::Type::Surfaceless && !SupportsExtension(VK_KHR_SURFACE_EXTENSION_NAME, true))
-    return false;
-
-#if defined(VK_USE_PLATFORM_WIN32_KHR)
-  if (wi.type == WindowInfo::Type::Win32 && !SupportsExtension(VK_KHR_WIN32_SURFACE_EXTENSION_NAME, true))
-    return false;
-#endif
-#if defined(VK_USE_PLATFORM_XLIB_KHR)
-  if (wi.type == WindowInfo::Type::X11 && !SupportsExtension(VK_KHR_XLIB_SURFACE_EXTENSION_NAME, true))
-    return false;
-#endif
-#if defined(VK_USE_PLATFORM_WAYLAND_KHR)
-  if (wi.type == WindowInfo::Type::Wayland && !SupportsExtension(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, true))
-    return false;
-#endif
-#if defined(VK_USE_PLATFORM_METAL_EXT)
-  if (wi.type == WindowInfo::Type::MacOS && !SupportsExtension(VK_EXT_METAL_SURFACE_EXTENSION_NAME, true))
-    return false;
-#endif
-#if defined(VK_USE_PLATFORM_ANDROID_KHR)
-  if (wi.type == WindowInfo::Type::Android && !SupportsExtension(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME, true))
-    return false;
-#endif
-
-  // VK_EXT_debug_utils
-  if (enable_debug_utils && !SupportsExtension(VK_EXT_DEBUG_UTILS_EXTENSION_NAME, false))
-    Log_WarningPrintf("Vulkan: Debug report requested, but extension is not available.");
-
-  // Needed for exclusive fullscreen control.
-  SupportsExtension(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME, false);
-
-  return true;
-}
-
-VulkanDevice::GPUList VulkanDevice::EnumerateGPUs(VkInstance instance)
-{
-  GPUList gpus;
-
-  u32 gpu_count = 0;
-  VkResult res = vkEnumeratePhysicalDevices(instance, &gpu_count, nullptr);
-  if ((res != VK_SUCCESS && res != VK_INCOMPLETE) || gpu_count == 0)
-  {
-    LOG_VULKAN_ERROR(res, "vkEnumeratePhysicalDevices (1) failed: ");
-    return gpus;
-  }
-
-  std::vector<VkPhysicalDevice> physical_devices(gpu_count);
-  res = vkEnumeratePhysicalDevices(instance, &gpu_count, physical_devices.data());
-  if (res == VK_INCOMPLETE)
-  {
-    Log_WarningFmt("First vkEnumeratePhysicalDevices() call returned {} devices, but second returned {}",
-                   physical_devices.size(), gpu_count);
-  }
-  else if (res != VK_SUCCESS)
-  {
-    LOG_VULKAN_ERROR(res, "vkEnumeratePhysicalDevices (2) failed: ");
-    return gpus;
-  }
-
-  // Maybe we lost a GPU?
-  if (gpu_count < physical_devices.size())
-    physical_devices.resize(gpu_count);
-
-  gpus.reserve(physical_devices.size());
-  for (VkPhysicalDevice device : physical_devices)
-  {
-    VkPhysicalDeviceProperties props = {};
-    vkGetPhysicalDeviceProperties(device, &props);
-
-    // Skip GPUs which don't support Vulkan 1.1, since we won't be able to create a device with them anyway.
-    if (VK_API_VERSION_VARIANT(props.apiVersion) == 0 && VK_API_VERSION_MAJOR(props.apiVersion) <= 1 &&
-        VK_API_VERSION_MINOR(props.apiVersion) < 1)
+  const auto AddExtension = [&enabled_extensions](const char* name) {
+    if (std::none_of(enabled_extensions.begin(), enabled_extensions.end(),
+                     [&](const char* existing_name) { return (std::strcmp(existing_name, name) == 0); }))
     {
-      Log_WarningFmt("Ignoring Vulkan GPU '{}' because it only claims support for Vulkan {}.{}.{}", props.deviceName,
-                     VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion),
-                     VK_API_VERSION_PATCH(props.apiVersion));
-      continue;
+      DEV_LOG("Enabling extension: {}", name);
+      enabled_extensions.push_back(name);
     }
 
-    std::string gpu_name = props.deviceName;
+    return true;
+  };
+  const auto SupportsAndAddExtension = [&](const char* name) {
+    if (!SupportsExtension(name))
+      return false;
 
-    // handle duplicate adapter names
-    if (std::any_of(gpus.begin(), gpus.end(), [&gpu_name](const auto& other) { return (gpu_name == other.second); }))
+    AddExtension(name);
+    return true;
+  };
+
+  if (enable_surface && !SupportsAndAddExtension(VK_KHR_SWAPCHAIN_EXTENSION_NAME))
+    return false;
+
+  // get api version, and fixup any bad values from the driver
+  vkGetPhysicalDeviceProperties(physical_device, &m_device_properties);
+  m_device_properties.limits.minUniformBufferOffsetAlignment =
+    std::max(m_device_properties.limits.minUniformBufferOffsetAlignment, static_cast<VkDeviceSize>(16));
+  m_device_properties.limits.optimalBufferCopyOffsetAlignment =
+    std::max(m_device_properties.limits.optimalBufferCopyOffsetAlignment, static_cast<VkDeviceSize>(1));
+  m_device_properties.limits.optimalBufferCopyRowPitchAlignment =
+    std::max(m_device_properties.limits.optimalBufferCopyRowPitchAlignment, static_cast<VkDeviceSize>(1));
+  m_uniform_buffer_alignment = static_cast<u32>(m_device_properties.limits.minUniformBufferOffsetAlignment);
+
+  // advanced feature checks
+  VkPhysicalDeviceFeatures2 features2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, nullptr, {}};
+  VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT rasterization_order_access_feature = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT, nullptr, VK_FALSE, VK_FALSE,
+    VK_FALSE};
+  VkPhysicalDeviceDynamicRenderingFeatures dynamic_rendering_feature = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES, nullptr, VK_FALSE};
+  VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR dynamic_rendering_local_read_feature = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, nullptr, VK_FALSE};
+  VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT fragment_shader_interlock_feature = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT, nullptr, VK_FALSE, VK_FALSE, VK_FALSE};
+  VkPhysicalDeviceMaintenance4Features maintenance4_features = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES, nullptr, VK_FALSE};
+  VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5_features = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, nullptr, VK_FALSE};
+
+  // add in optional feature structs
+  // Gate most of the extension checks behind a Vulkan 1.1 device, so we don't have to deal with situations where
+  // some extensions are supported but not others, and the prerequisite extensions for those extensions.
+  if (m_device_properties.apiVersion >= VK_API_VERSION_1_1)
+  {
+    if (SupportsExtension(VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME) ||
+        SupportsExtension(VK_ARM_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME))
     {
-      std::string original_adapter_name = std::move(gpu_name);
-
-      u32 current_extra = 2;
-      do
-      {
-        gpu_name = fmt::format("{} ({})", original_adapter_name, current_extra);
-        current_extra++;
-      } while (
-        std::any_of(gpus.begin(), gpus.end(), [&gpu_name](const auto& other) { return (gpu_name == other.second); }));
+      m_optional_extensions.vk_ext_rasterization_order_attachment_access = true;
+      Vulkan::AddPointerToChain(&features2, &rasterization_order_access_feature);
     }
-
-    gpus.emplace_back(device, std::move(gpu_name));
-  }
-
-  return gpus;
-}
-
-bool VulkanDevice::SelectDeviceExtensions(ExtensionList* extension_list, bool enable_surface)
-{
-  u32 extension_count = 0;
-  VkResult res = vkEnumerateDeviceExtensionProperties(m_physical_device, nullptr, &extension_count, nullptr);
-  if (res != VK_SUCCESS)
-  {
-    LOG_VULKAN_ERROR(res, "vkEnumerateDeviceExtensionProperties failed: ");
-    return false;
-  }
-
-  if (extension_count == 0)
-  {
-    Log_ErrorPrintf("Vulkan: No extensions supported by device.");
-    return false;
-  }
-
-  std::vector<VkExtensionProperties> available_extension_list(extension_count);
-  res =
-    vkEnumerateDeviceExtensionProperties(m_physical_device, nullptr, &extension_count, available_extension_list.data());
-  DebugAssert(res == VK_SUCCESS);
-
-  auto SupportsExtension = [&](const char* name, bool required) {
-    if (std::find_if(available_extension_list.begin(), available_extension_list.end(),
-                     [&](const VkExtensionProperties& properties) {
-                       return !strcmp(name, properties.extensionName);
-                     }) != available_extension_list.end())
+    if (SupportsExtension(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME) &&
+        SupportsExtension(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME) &&
+        SupportsExtension(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME))
     {
-      if (std::none_of(extension_list->begin(), extension_list->end(),
-                       [&](const char* existing_name) { return (std::strcmp(existing_name, name) == 0); }))
+      m_optional_extensions.vk_khr_dynamic_rendering = true;
+      Vulkan::AddPointerToChain(&features2, &dynamic_rendering_feature);
+
+      if (SupportsExtension(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME))
       {
-        Log_DevPrintf("Enabling extension: %s", name);
-        extension_list->push_back(name);
+        m_optional_extensions.vk_khr_dynamic_rendering_local_read = true;
+        Vulkan::AddPointerToChain(&features2, &dynamic_rendering_local_read_feature);
       }
 
-      return true;
+      if (SupportsExtension(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME))
+      {
+        m_optional_extensions.vk_ext_fragment_shader_interlock = true;
+        Vulkan::AddPointerToChain(&features2, &fragment_shader_interlock_feature);
+      }
+    }
+    if (SupportsExtension(VK_KHR_MAINTENANCE_4_EXTENSION_NAME))
+    {
+      m_optional_extensions.vk_khr_maintenance4 = true;
+      Vulkan::AddPointerToChain(&features2, &maintenance4_features);
+
+      if (SupportsExtension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME))
+      {
+        m_optional_extensions.vk_khr_maintenance5 = true;
+        Vulkan::AddPointerToChain(&features2, &maintenance5_features);
+      }
+    }
+  }
+
+  // don't bother querying if we're not actually looking at any features
+  if (vkGetPhysicalDeviceFeatures2 && features2.pNext)
+    vkGetPhysicalDeviceFeatures2(physical_device, &features2);
+  else
+    vkGetPhysicalDeviceFeatures(physical_device, &features2.features);
+
+  // confirm we actually support it
+  m_optional_extensions.vk_ext_rasterization_order_attachment_access &=
+    (rasterization_order_access_feature.rasterizationOrderColorAttachmentAccess == VK_TRUE);
+  m_optional_extensions.vk_khr_dynamic_rendering &= (dynamic_rendering_feature.dynamicRendering == VK_TRUE);
+  m_optional_extensions.vk_khr_dynamic_rendering_local_read &=
+    (dynamic_rendering_local_read_feature.dynamicRenderingLocalRead == VK_TRUE);
+  m_optional_extensions.vk_ext_fragment_shader_interlock &=
+    (m_optional_extensions.vk_khr_dynamic_rendering &&
+     fragment_shader_interlock_feature.fragmentShaderPixelInterlock == VK_TRUE);
+  m_optional_extensions.vk_khr_maintenance4 &= (maintenance4_features.maintenance4 == VK_TRUE);
+  m_optional_extensions.vk_khr_maintenance5 &=
+    (m_optional_extensions.vk_khr_dynamic_rendering && maintenance5_features.maintenance5 == VK_TRUE);
+
+  VkPhysicalDeviceProperties2 properties2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, nullptr, {}};
+  VkPhysicalDevicePushDescriptorPropertiesKHR push_descriptor_properties = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR, nullptr, 0u};
+  VkPhysicalDeviceExternalMemoryHostPropertiesEXT external_memory_host_properties = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT, nullptr, 0};
+
+  if (SupportsExtension(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME))
+  {
+    m_optional_extensions.vk_khr_driver_properties = true;
+    m_device_driver_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+    Vulkan::AddPointerToChain(&properties2, &m_device_driver_properties);
+  }
+
+  if (SupportsExtension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME))
+  {
+    m_optional_extensions.vk_khr_push_descriptor = true;
+    Vulkan::AddPointerToChain(&properties2, &push_descriptor_properties);
+  }
+
+  if (SupportsExtension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME))
+  {
+    m_optional_extensions.vk_ext_external_memory_host = true;
+    Vulkan::AddPointerToChain(&properties2, &external_memory_host_properties);
+  }
+
+  // don't bother querying if we're not actually looking at any features
+  if (vkGetPhysicalDeviceProperties2 && properties2.pNext)
+    vkGetPhysicalDeviceProperties2(physical_device, &properties2);
+
+  // set driver type
+  SetDriverType(VulkanLoader::GuessDriverType(m_device_properties, m_device_driver_properties));
+
+  // check we actually support enough
+  m_optional_extensions.vk_khr_push_descriptor &= (push_descriptor_properties.maxPushDescriptors >= 1);
+
+  // vk_ext_external_memory_host is only used if the import alignment is the same as the system's page size
+  m_optional_extensions.vk_ext_external_memory_host &=
+    (external_memory_host_properties.minImportedHostPointerAlignment <= HOST_PAGE_SIZE);
+
+  if (m_driver_type == GPUDriverType::QualcommProprietary || m_driver_type == GPUDriverType::ARMProprietary ||
+      m_driver_type == GPUDriverType::ImaginationProprietary)
+  {
+    // Push descriptor is broken on Adreno v502.. don't want to think about dynamic rendending.
+    if (m_optional_extensions.vk_khr_dynamic_rendering)
+    {
+      m_optional_extensions.vk_khr_dynamic_rendering = false;
+      m_optional_extensions.vk_khr_dynamic_rendering_local_read = false;
+      m_optional_extensions.vk_ext_fragment_shader_interlock = false;
+      m_optional_extensions.vk_khr_maintenance5 = false;
+      WARNING_LOG("Disabling VK_KHR_dynamic_rendering on broken mobile driver.");
+    }
+    if (m_optional_extensions.vk_khr_push_descriptor)
+    {
+      m_optional_extensions.vk_khr_push_descriptor = false;
+      WARNING_LOG("Disabling VK_KHR_push_descriptor on broken mobile driver.");
+    }
+  }
+  else if (m_driver_type == GPUDriverType::AMDProprietary)
+  {
+    // VK_KHR_dynamic_rendering_local_read appears to be broken on RDNA3, like everything else...
+    // Just causes GPU resets when you actually use a feedback loop. Assume Mesa is fine.
+    // VK_EXT_fragment_shader_interlock is similar, random GPU hangs.
+#if defined(_WIN32) || defined(__ANDROID__)
+    m_optional_extensions.vk_ext_fragment_shader_interlock = false;
+    m_optional_extensions.vk_khr_dynamic_rendering_local_read = false;
+    WARNING_LOG(
+      "Disabling VK_EXT_fragment_shader_interlock and VK_KHR_dynamic_rendering_local_read on broken AMD driver.");
+#endif
+  }
+  else if (m_driver_type == GPUDriverType::LLVMPipe)
+  {
+    // Rendering behaviour with llvmpipe + fbfetch is very strange, it fails to read push constants sometimes??
+    m_optional_extensions.vk_ext_rasterization_order_attachment_access = false;
+    WARNING_LOG("Disabling VK_EXT_rasterization_order_attachment_access on llvmpipe driver.");
+  }
+
+  // Actually enable the extensions. See above for VK1.1 reasoning.
+  if (m_device_properties.apiVersion >= VK_API_VERSION_1_1)
+  {
+    m_optional_extensions.vk_ext_memory_budget = SupportsAndAddExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    m_optional_extensions.vk_khr_driver_properties = SupportsAndAddExtension(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME);
+
+    // glslang generates debug info instructions before phi nodes at the beginning of blocks when non-semantic debug
+    // info is enabled, triggering errors by spirv-val. Gate it by an environment variable if you want source debugging
+    // until this is fixed.
+    if (const char* val = std::getenv("USE_NON_SEMANTIC_DEBUG_INFO");
+        val && StringUtil::FromChars<bool>(val).value_or(false))
+    {
+      m_optional_extensions.vk_khr_shader_non_semantic_info =
+        SupportsAndAddExtension(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
     }
 
-    if (required)
-      Log_ErrorPrintf("Vulkan: Missing required extension %s.", name);
+    if (m_optional_extensions.vk_ext_rasterization_order_attachment_access)
+    {
+      if (!SupportsAndAddExtension(VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME))
+        SupportsAndAddExtension(VK_ARM_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME);
+    }
+    if (m_optional_extensions.vk_khr_dynamic_rendering)
+    {
+      AddExtension(VK_KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME);
+      AddExtension(VK_KHR_CREATE_RENDERPASS_2_EXTENSION_NAME);
+      AddExtension(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);
 
-    return false;
-  };
+      if (m_optional_extensions.vk_khr_dynamic_rendering_local_read)
+        AddExtension(VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
+    }
+    if (m_optional_extensions.vk_khr_push_descriptor)
+      AddExtension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
 
-  if (enable_surface && !SupportsExtension(VK_KHR_SWAPCHAIN_EXTENSION_NAME, true))
-    return false;
+    if (m_optional_extensions.vk_ext_external_memory_host)
+      AddExtension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
 
-  m_optional_extensions.vk_ext_memory_budget = SupportsExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, false);
-  m_optional_extensions.vk_ext_rasterization_order_attachment_access =
-    SupportsExtension(VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME, false) ||
-    SupportsExtension(VK_ARM_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME, false);
-  m_optional_extensions.vk_ext_attachment_feedback_loop_layout =
-    SupportsExtension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME, false);
-  m_optional_extensions.vk_khr_driver_properties = SupportsExtension(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME, false);
-  m_optional_extensions.vk_khr_push_descriptor = SupportsExtension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, false);
+    // Dynamic rendering isn't strictly needed for FSI, but we want it with framebufferless rendering.
+    if (m_optional_extensions.vk_ext_fragment_shader_interlock)
+      AddExtension(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
+
+    if (m_optional_extensions.vk_khr_maintenance4)
+      AddExtension(VK_KHR_MAINTENANCE_4_EXTENSION_NAME);
+
+    if (m_optional_extensions.vk_khr_maintenance5)
+      AddExtension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+
+    // Driver support for swapchain maintenance is a mess... try KHR first, then EXT.
+    m_optional_extensions.vk_khr_swapchain_maintenance1 =
+      enable_surface && VulkanLoader::GetOptionalExtensions().vk_khr_surface_maintenance1 &&
+      (SupportsAndAddExtension(VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME) ||
+       SupportsAndAddExtension(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME));
+  }
+
+  // Enable the features we use.
+  enabled_features.dualSrcBlend |= features2.features.dualSrcBlend;
+  enabled_features.largePoints |= features2.features.largePoints;
+  enabled_features.wideLines |= features2.features.wideLines;
+  enabled_features.samplerAnisotropy |= features2.features.samplerAnisotropy;
+  enabled_features.sampleRateShading |= features2.features.sampleRateShading;
+  enabled_features.geometryShader |= features2.features.geometryShader;
+  enabled_features.fragmentStoresAndAtomics |= features2.features.fragmentStoresAndAtomics;
+  enabled_features.textureCompressionBC |= features2.features.textureCompressionBC;
+
+#define LOG_EXT(name, field)                                                                                           \
+  GENERIC_LOG(___LogChannel___, Log::Level::Info,                                                                      \
+              m_optional_extensions.field ? Log::Color::StrongGreen : Log::Color::StrongOrange, name " is {}",         \
+              m_optional_extensions.field ? "supported" : "NOT supported")
+
+  LOG_EXT("VK_EXT_external_memory_host", vk_ext_external_memory_host);
+  LOG_EXT("VK_EXT_fragment_shader_interlock", vk_ext_fragment_shader_interlock);
+  LOG_EXT("VK_EXT_memory_budget", vk_ext_memory_budget);
+  LOG_EXT("VK_EXT_rasterization_order_attachment_access", vk_ext_rasterization_order_attachment_access);
+  LOG_EXT("VK_KHR_driver_properties", vk_khr_driver_properties);
+  LOG_EXT("VK_KHR_dynamic_rendering", vk_khr_dynamic_rendering);
+  LOG_EXT("VK_KHR_dynamic_rendering_local_read", vk_khr_dynamic_rendering_local_read);
+  LOG_EXT("VK_KHR_maintenance4", vk_khr_maintenance4);
+  LOG_EXT("VK_KHR_maintenance5", vk_khr_maintenance5);
+  LOG_EXT("VK_KHR_push_descriptor", vk_khr_push_descriptor);
+  LOG_EXT("VK_KHR_swapchain_maintenance1", vk_khr_swapchain_maintenance1);
 
 #ifdef _WIN32
   m_optional_extensions.vk_ext_full_screen_exclusive =
-    enable_surface && SupportsExtension(VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME, false);
-  Log_InfoPrintf("VK_EXT_full_screen_exclusive is %s",
-                 m_optional_extensions.vk_ext_full_screen_exclusive ? "supported" : "NOT supported");
+    (enable_surface && VulkanLoader::GetOptionalExtensions().vk_khr_get_surface_capabilities2 &&
+     SupportsAndAddExtension(VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME));
+  LOG_EXT("VK_EXT_full_screen_exclusive", vk_ext_full_screen_exclusive);
 #endif
 
-  return true;
-}
-
-bool VulkanDevice::SelectDeviceFeatures()
-{
-  VkPhysicalDeviceFeatures available_features;
-  vkGetPhysicalDeviceFeatures(m_physical_device, &available_features);
-
-  // Enable the features we use.
-  m_device_features.dualSrcBlend = available_features.dualSrcBlend;
-  m_device_features.largePoints = available_features.largePoints;
-  m_device_features.wideLines = available_features.wideLines;
-  m_device_features.samplerAnisotropy = available_features.samplerAnisotropy;
-  m_device_features.sampleRateShading = available_features.sampleRateShading;
-  m_device_features.geometryShader = available_features.geometryShader;
+#undef LOG_EXT
 
   return true;
 }
 
-bool VulkanDevice::CreateDevice(VkSurfaceKHR surface, bool enable_validation_layer)
+bool VulkanDevice::CreateDevice(VkPhysicalDevice physical_device, VkSurfaceKHR surface, CreateFlags create_flags,
+                                Error* error)
 {
   u32 queue_family_count;
-  vkGetPhysicalDeviceQueueFamilyProperties(m_physical_device, &queue_family_count, nullptr);
+  vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, nullptr);
   if (queue_family_count == 0)
   {
-    Log_ErrorPrintf("No queue families found on specified vulkan physical device.");
+    ERROR_LOG("No queue families found on specified vulkan physical device.");
+    Error::SetStringView(error, "No queue families found on specified vulkan physical device.");
     return false;
   }
 
-  std::vector<VkQueueFamilyProperties> queue_family_properties(queue_family_count);
-  vkGetPhysicalDeviceQueueFamilyProperties(m_physical_device, &queue_family_count, queue_family_properties.data());
-  Log_DevPrintf("%u vulkan queue families", queue_family_count);
+  DynamicHeapArray<VkQueueFamilyProperties> queue_family_properties(queue_family_count);
+  vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, queue_family_properties.data());
+  DEV_LOG("{} vulkan queue families", queue_family_count);
 
   // Find graphics and present queues.
   m_graphics_queue_family_index = queue_family_count;
@@ -406,43 +453,41 @@ bool VulkanDevice::CreateDevice(VkSurfaceKHR surface, bool enable_validation_lay
     if (graphics_supported)
     {
       m_graphics_queue_family_index = i;
+
       // Quit now, no need for a present queue.
       if (!surface)
-      {
         break;
-      }
     }
 
     if (surface)
     {
       VkBool32 present_supported;
-      VkResult res = vkGetPhysicalDeviceSurfaceSupportKHR(m_physical_device, i, surface, &present_supported);
+      VkResult res = vkGetPhysicalDeviceSurfaceSupportKHR(physical_device, i, surface, &present_supported);
       if (res != VK_SUCCESS)
       {
         LOG_VULKAN_ERROR(res, "vkGetPhysicalDeviceSurfaceSupportKHR failed: ");
+        Vulkan::SetErrorObject(error, "vkGetPhysicalDeviceSurfaceSupportKHR failed: ", res);
         return false;
       }
 
       if (present_supported)
-      {
         m_present_queue_family_index = i;
-      }
 
       // Prefer one queue family index that does both graphics and present.
       if (graphics_supported && present_supported)
-      {
         break;
-      }
     }
   }
   if (m_graphics_queue_family_index == queue_family_count)
   {
-    Log_ErrorPrintf("Vulkan: Failed to find an acceptable graphics queue.");
+    ERROR_LOG("Vulkan: Failed to find an acceptable graphics queue.");
+    Error::SetStringView(error, "Vulkan: Failed to find an acceptable graphics queue.");
     return false;
   }
   if (surface != VK_NULL_HANDLE && m_present_queue_family_index == queue_family_count)
   {
-    Log_ErrorPrintf("Vulkan: Failed to find an acceptable present queue.");
+    ERROR_LOG("Vulkan: Failed to find an acceptable present queue.");
+    Error::SetStringView(error, "Vulkan: Failed to find an acceptable present queue.");
     return false;
   }
 
@@ -475,50 +520,99 @@ bool VulkanDevice::CreateDevice(VkSurfaceKHR surface, bool enable_validation_lay
 
   device_info.pQueueCreateInfos = queue_infos.data();
 
-  ExtensionList enabled_extensions;
-  if (!SelectDeviceExtensions(&enabled_extensions, surface != VK_NULL_HANDLE))
+  u32 extension_count = 0;
+  VkResult res = vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count, nullptr);
+  if (res != VK_SUCCESS)
+  {
+    LOG_VULKAN_ERROR(res, "vkEnumerateDeviceExtensionProperties failed: ");
+    Vulkan::SetErrorObject(error, "vkEnumerateDeviceExtensionProperties failed: ", res);
     return false;
+  }
+
+  if (extension_count == 0)
+  {
+    ERROR_LOG("No extensions supported by device.");
+    Error::SetStringView(error, "No extensions supported by device.");
+    return false;
+  }
+
+  DynamicHeapArray<VkExtensionProperties> available_extension_list(extension_count);
+  res =
+    vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &extension_count, available_extension_list.data());
+  DebugAssert(res == VK_SUCCESS);
+
+  VkPhysicalDeviceFeatures enabled_features = {};
+  ExtensionList enabled_extensions;
+  if (!EnableOptionalDeviceExtensions(physical_device, available_extension_list.cspan(), enabled_extensions,
+                                      enabled_features, surface != VK_NULL_HANDLE, error))
+  {
+    return false;
+  }
 
   device_info.enabledExtensionCount = static_cast<uint32_t>(enabled_extensions.size());
   device_info.ppEnabledExtensionNames = enabled_extensions.data();
+  device_info.pEnabledFeatures = &enabled_features;
 
-  // Check for required features before creating.
-  if (!SelectDeviceFeatures())
-    return false;
-
-  device_info.pEnabledFeatures = &m_device_features;
-
-  // Enable debug layer on debug builds
-  if (enable_validation_layer)
-  {
-    static const char* layer_names[] = {"VK_LAYER_LUNARG_standard_validation"};
-    device_info.enabledLayerCount = 1;
-    device_info.ppEnabledLayerNames = layer_names;
-  }
-
+  // Optional feature structs
   VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT rasterization_order_access_feature = {
     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT, nullptr, VK_TRUE, VK_FALSE,
     VK_FALSE};
-  VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT attachment_feedback_loop_feature = {
-    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT, nullptr, VK_TRUE};
+  VkPhysicalDeviceDynamicRenderingFeatures dynamic_rendering_feature = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES, nullptr, VK_TRUE};
+  VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR dynamic_rendering_local_read_feature = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, nullptr, VK_TRUE};
+  VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR swapchain_maintenance1_feature = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR, nullptr, VK_TRUE};
+  VkPhysicalDeviceFragmentShaderInterlockFeaturesEXT fragment_shader_interlock_feature = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_INTERLOCK_FEATURES_EXT, nullptr, VK_FALSE, VK_TRUE, VK_FALSE};
+  VkPhysicalDeviceMaintenance4Features maintenance4_features = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES, nullptr, VK_TRUE};
+  VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5_features = {
+    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR, nullptr, VK_TRUE};
 
   if (m_optional_extensions.vk_ext_rasterization_order_attachment_access)
     Vulkan::AddPointerToChain(&device_info, &rasterization_order_access_feature);
-  if (m_optional_extensions.vk_ext_attachment_feedback_loop_layout)
-    Vulkan::AddPointerToChain(&device_info, &attachment_feedback_loop_feature);
+  if (m_optional_extensions.vk_khr_swapchain_maintenance1)
+    Vulkan::AddPointerToChain(&device_info, &swapchain_maintenance1_feature);
+  if (m_optional_extensions.vk_khr_dynamic_rendering)
+  {
+    Vulkan::AddPointerToChain(&device_info, &dynamic_rendering_feature);
+    if (m_optional_extensions.vk_khr_dynamic_rendering_local_read)
+      Vulkan::AddPointerToChain(&device_info, &dynamic_rendering_local_read_feature);
+    if (m_optional_extensions.vk_ext_fragment_shader_interlock)
+      Vulkan::AddPointerToChain(&device_info, &fragment_shader_interlock_feature);
+  }
+  if (m_optional_extensions.vk_khr_maintenance4)
+  {
+    Vulkan::AddPointerToChain(&device_info, &maintenance4_features);
+    if (m_optional_extensions.vk_khr_maintenance5)
+      Vulkan::AddPointerToChain(&device_info, &maintenance5_features);
+  }
 
-  VkResult res = vkCreateDevice(m_physical_device, &device_info, nullptr, &m_device);
+  VkDevice device;
+  res = vkCreateDevice(physical_device, &device_info, nullptr, &device);
   if (res != VK_SUCCESS)
   {
     LOG_VULKAN_ERROR(res, "vkCreateDevice failed: ");
+    Vulkan::SetErrorObject(error, "vkCreateDevice failed: ", res);
     return false;
   }
 
   // With the device created, we can fill the remaining entry points.
-  if (!Vulkan::LoadVulkanDeviceFunctions(m_device))
+  m_physical_device = physical_device;
+  if (!VulkanLoader::LoadDeviceFunctions(device, error))
+  {
+    if (vkDestroyDevice)
+      vkDestroyDevice(device, nullptr);
+    else
+      ERROR_LOG("Vulkan device leaked because vkDestroyDevice() function pointer was null.");
+
+    VulkanLoader::ResetDeviceFunctions();
     return false;
+  }
 
   // Grab the graphics and present queues.
+  m_device = device;
   vkGetDeviceQueue(m_device, m_graphics_queue_family_index, 0, &m_graphics_queue);
   if (surface)
     vkGetDeviceQueue(m_device, m_present_queue_family_index, 0, &m_present_queue);
@@ -526,79 +620,48 @@ bool VulkanDevice::CreateDevice(VkSurfaceKHR surface, bool enable_validation_lay
   m_features.gpu_timing = (m_device_properties.limits.timestampComputeAndGraphics != 0 &&
                            queue_family_properties[m_graphics_queue_family_index].timestampValidBits > 0 &&
                            m_device_properties.limits.timestampPeriod > 0);
-  Log_DevPrintf("GPU timing is %s (TS=%u TS valid bits=%u, TS period=%f)",
-                m_features.gpu_timing ? "supported" : "not supported",
-                static_cast<u32>(m_device_properties.limits.timestampComputeAndGraphics),
-                queue_family_properties[m_graphics_queue_family_index].timestampValidBits,
-                m_device_properties.limits.timestampPeriod);
+  DEV_LOG("GPU timing is {} (TS={} TS valid bits={}, TS period={})",
+          m_features.gpu_timing ? "supported" : "not supported",
+          static_cast<u32>(m_device_properties.limits.timestampComputeAndGraphics),
+          queue_family_properties[m_graphics_queue_family_index].timestampValidBits,
+          m_device_properties.limits.timestampPeriod);
 
-  ProcessDeviceExtensions();
+  SetFeatures(create_flags, physical_device, enabled_features);
   return true;
-}
-
-void VulkanDevice::ProcessDeviceExtensions()
-{
-  // advanced feature checks
-  VkPhysicalDeviceFeatures2 features2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, nullptr, {}};
-  VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT rasterization_order_access_feature = {
-    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT, nullptr, VK_FALSE, VK_FALSE,
-    VK_FALSE};
-  VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT attachment_feedback_loop_feature = {
-    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT, nullptr, VK_FALSE};
-
-  // add in optional feature structs
-  if (m_optional_extensions.vk_ext_rasterization_order_attachment_access)
-    Vulkan::AddPointerToChain(&features2, &rasterization_order_access_feature);
-  if (m_optional_extensions.vk_ext_attachment_feedback_loop_layout)
-    Vulkan::AddPointerToChain(&features2, &attachment_feedback_loop_feature);
-
-  // query
-  vkGetPhysicalDeviceFeatures2(m_physical_device, &features2);
-
-  // confirm we actually support it
-  m_optional_extensions.vk_ext_rasterization_order_attachment_access &=
-    (rasterization_order_access_feature.rasterizationOrderColorAttachmentAccess == VK_TRUE);
-  m_optional_extensions.vk_ext_attachment_feedback_loop_layout &=
-    (attachment_feedback_loop_feature.attachmentFeedbackLoopLayout == VK_TRUE);
-
-  VkPhysicalDeviceProperties2 properties2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, nullptr, {}};
-  VkPhysicalDevicePushDescriptorPropertiesKHR push_descriptor_properties = {
-    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR, nullptr, 0u};
-
-  if (m_optional_extensions.vk_khr_driver_properties)
-  {
-    m_device_driver_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
-    Vulkan::AddPointerToChain(&properties2, &m_device_driver_properties);
-  }
-  if (m_optional_extensions.vk_khr_push_descriptor)
-    Vulkan::AddPointerToChain(&properties2, &push_descriptor_properties);
-
-  // query
-  vkGetPhysicalDeviceProperties2(m_physical_device, &properties2);
-
-  m_optional_extensions.vk_khr_push_descriptor &= (push_descriptor_properties.maxPushDescriptors >= 1);
-
-  Log_InfoPrintf("VK_EXT_memory_budget is %s",
-                 m_optional_extensions.vk_ext_memory_budget ? "supported" : "NOT supported");
-  Log_InfoPrintf("VK_EXT_rasterization_order_attachment_access is %s",
-                 m_optional_extensions.vk_ext_rasterization_order_attachment_access ? "supported" : "NOT supported");
-  Log_InfoPrintf("VK_EXT_attachment_feedback_loop_layout is %s",
-                 m_optional_extensions.vk_ext_attachment_feedback_loop_layout ? "supported" : "NOT supported");
-  Log_InfoPrintf("VK_KHR_push_descriptor is %s",
-                 m_optional_extensions.vk_khr_push_descriptor ? "supported" : "NOT supported");
 }
 
 bool VulkanDevice::CreateAllocator()
 {
+  const u32 apiVersion = std::min(m_device_properties.apiVersion, VK_API_VERSION_1_1);
+  INFO_LOG("Supported device API version: {}.{}.{}, using version {}.{}.{} for allocator.",
+           VK_API_VERSION_MAJOR(m_device_properties.apiVersion), VK_API_VERSION_MINOR(m_device_properties.apiVersion),
+           VK_API_VERSION_PATCH(m_device_properties.apiVersion), VK_API_VERSION_MAJOR(apiVersion),
+           VK_API_VERSION_MINOR(apiVersion), VK_API_VERSION_PATCH(apiVersion));
+
   VmaAllocatorCreateInfo ci = {};
-  ci.vulkanApiVersion = VK_API_VERSION_1_1;
+  ci.vulkanApiVersion = apiVersion;
   ci.flags = VMA_ALLOCATOR_CREATE_EXTERNALLY_SYNCHRONIZED_BIT;
   ci.physicalDevice = m_physical_device;
   ci.device = m_device;
-  ci.instance = m_instance;
+  ci.instance = VulkanLoader::GetVulkanInstance();
 
   if (m_optional_extensions.vk_ext_memory_budget)
+  {
+    DEV_LOG("Enabling VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT.");
     ci.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+  }
+
+  if (m_optional_extensions.vk_khr_maintenance4)
+  {
+    DEV_LOG("Enabling VMA_ALLOCATOR_CREATE_KHR_MAINTENANCE4_BIT");
+    ci.flags |= VMA_ALLOCATOR_CREATE_KHR_MAINTENANCE4_BIT;
+  }
+
+  if (m_optional_extensions.vk_khr_maintenance5)
+  {
+    DEV_LOG("Enabling VMA_ALLOCATOR_CREATE_KHR_MAINTENANCE5_BIT");
+    ci.flags |= VMA_ALLOCATOR_CREATE_KHR_MAINTENANCE5_BIT;
+  }
 
   // Limit usage of the DEVICE_LOCAL upload heap when we're using a debug device.
   // On NVIDIA drivers, it results in frequently running out of device memory when trying to
@@ -627,8 +690,8 @@ bool VulkanDevice::CreateAllocator()
 
       if (heap_size_limits[type.heapIndex] == VK_WHOLE_SIZE)
       {
-        Log_WarningPrintf("Disabling allocation from upload heap #%u (%.2f MB) due to debug device.", type.heapIndex,
-                          static_cast<float>(heap.size) / 1048576.0f);
+        WARNING_LOG("Disabling allocation from upload heap #{} ({:.2f} MB) due to debug device.", type.heapIndex,
+                    static_cast<float>(heap.size) / 1048576.0f);
         heap_size_limits[type.heapIndex] = 0;
         has_upload_heap = true;
       }
@@ -661,11 +724,9 @@ bool VulkanDevice::CreateCommandBuffers()
 {
   VkResult res;
 
-  uint32_t frame_index = 0;
+  u32 frame_index = 0;
   for (CommandBuffer& resources : m_frame_resources)
   {
-    resources.needs_fence_wait = false;
-
     VkCommandPoolCreateInfo pool_info = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, nullptr, 0,
                                          m_graphics_queue_family_index};
     res = vkCreateCommandPool(m_device, &pool_info, nullptr, &resources.command_pool);
@@ -674,7 +735,8 @@ bool VulkanDevice::CreateCommandBuffers()
       LOG_VULKAN_ERROR(res, "vkCreateCommandPool failed: ");
       return false;
     }
-    Vulkan::SetObjectName(m_device, resources.command_pool, TinyString::from_fmt("Frame Command Pool {}", frame_index));
+    Vulkan::SetObjectName(m_device, resources.command_pool,
+                          TinyString::from_format("Frame Command Pool {}", frame_index));
 
     VkCommandBufferAllocateInfo buffer_info = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, nullptr,
                                                resources.command_pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY,
@@ -689,7 +751,7 @@ bool VulkanDevice::CreateCommandBuffers()
     for (u32 i = 0; i < resources.command_buffers.size(); i++)
     {
       Vulkan::SetObjectName(m_device, resources.command_buffers[i],
-                            TinyString::from_fmt("Frame {} {}Command Buffer", frame_index, (i == 0) ? "Init" : ""));
+                            TinyString::from_format("Frame {} {}Command Buffer", frame_index, (i == 0) ? "Init" : ""));
     }
 
     VkFenceCreateInfo fence_info = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, nullptr, VK_FENCE_CREATE_SIGNALED_BIT};
@@ -700,27 +762,28 @@ bool VulkanDevice::CreateCommandBuffers()
       LOG_VULKAN_ERROR(res, "vkCreateFence failed: ");
       return false;
     }
-    Vulkan::SetObjectName(m_device, resources.fence, TinyString::from_fmt("Frame Fence {}", frame_index));
+    Vulkan::SetObjectName(m_device, resources.fence, TinyString::from_format("Frame Fence {}", frame_index));
 
+    u32 num_pools = 0;
+    VkDescriptorPoolSize pool_sizes[2];
     if (!m_optional_extensions.vk_khr_push_descriptor)
     {
-      VkDescriptorPoolSize pool_sizes[] = {
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_COMBINED_IMAGE_SAMPLER_DESCRIPTORS_PER_FRAME},
-      };
-
-      VkDescriptorPoolCreateInfo pool_create_info = {
-        VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr,   0, MAX_DESCRIPTOR_SETS_PER_FRAME,
-        static_cast<u32>(std::size(pool_sizes)),       pool_sizes};
-
-      res = vkCreateDescriptorPool(m_device, &pool_create_info, nullptr, &resources.descriptor_pool);
-      if (res != VK_SUCCESS)
-      {
-        LOG_VULKAN_ERROR(res, "vkCreateDescriptorPool failed: ");
-        return false;
-      }
-      Vulkan::SetObjectName(m_device, resources.descriptor_pool,
-                            TinyString::from_fmt("Frame Descriptor Pool {}", frame_index));
+      pool_sizes[num_pools++] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                 MAX_COMBINED_IMAGE_SAMPLER_DESCRIPTORS_PER_FRAME};
     }
+    pool_sizes[num_pools++] = {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, MAX_INPUT_ATTACHMENT_DESCRIPTORS_PER_FRAME};
+
+    VkDescriptorPoolCreateInfo pool_create_info = {
+      VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, nullptr, 0, MAX_DESCRIPTOR_SETS_PER_FRAME, num_pools, pool_sizes};
+
+    res = vkCreateDescriptorPool(m_device, &pool_create_info, nullptr, &resources.descriptor_pool);
+    if (res != VK_SUCCESS)
+    {
+      LOG_VULKAN_ERROR(res, "vkCreateDescriptorPool failed: ");
+      return false;
+    }
+    Vulkan::SetObjectName(m_device, resources.descriptor_pool,
+                          TinyString::from_format("Frame Descriptor Pool {}", frame_index));
 
     ++frame_index;
   }
@@ -794,33 +857,107 @@ void VulkanDevice::DestroyPersistentDescriptorPool()
     vkDestroyDescriptorPool(m_device, m_global_descriptor_pool, nullptr);
 }
 
-VkRenderPass VulkanDevice::GetRenderPass(VkFormat color_format, VkFormat depth_format, VkSampleCountFlagBits samples,
-                                         VkAttachmentLoadOp color_load_op /* = VK_ATTACHMENT_LOAD_OP_LOAD */,
-                                         VkAttachmentStoreOp color_store_op /* = VK_ATTACHMENT_STORE_OP_STORE */,
-                                         VkAttachmentLoadOp depth_load_op /* = VK_ATTACHMENT_LOAD_OP_LOAD */,
-                                         VkAttachmentStoreOp depth_store_op /* = VK_ATTACHMENT_STORE_OP_STORE */,
-                                         VkAttachmentLoadOp stencil_load_op /* = VK_ATTACHMENT_LOAD_OP_DONT_CARE */,
-                                         VkAttachmentStoreOp stencil_store_op /* = VK_ATTACHMENT_STORE_OP_DONT_CARE */,
-                                         bool color_feedback_loop /* = false */, bool depth_sampling /* = false */)
+bool VulkanDevice::RenderPassCacheKey::operator==(const RenderPassCacheKey& rhs) const
 {
-  RenderPassCacheKey key = {};
-  key.color_format = color_format;
-  key.depth_format = depth_format;
-  key.samples = samples;
-  key.color_load_op = color_load_op;
-  key.color_store_op = color_store_op;
-  key.depth_load_op = depth_load_op;
-  key.depth_store_op = depth_store_op;
-  key.stencil_load_op = stencil_load_op;
-  key.stencil_store_op = stencil_store_op;
-  key.color_feedback_loop = color_feedback_loop;
-  key.depth_sampling = depth_sampling;
+  return (std::memcmp(this, &rhs, sizeof(*this)) == 0);
+}
 
-  auto it = m_render_pass_cache.find(key.key);
-  if (it != m_render_pass_cache.end())
-    return it->second;
+bool VulkanDevice::RenderPassCacheKey::operator!=(const RenderPassCacheKey& rhs) const
+{
+  return (std::memcmp(this, &rhs, sizeof(*this)) != 0);
+}
 
-  return CreateCachedRenderPass(key);
+size_t VulkanDevice::RenderPassCacheKeyHash::operator()(const RenderPassCacheKey& rhs) const
+{
+  if constexpr (sizeof(void*) == 8)
+    return XXH3_64bits(&rhs, sizeof(rhs));
+  else
+    return XXH32(&rhs, sizeof(rhs), 0x1337);
+}
+
+VkRenderPass VulkanDevice::GetRenderPass(const GPUPipeline::GraphicsConfig& config)
+{
+  RenderPassCacheKey key;
+  std::memset(&key, 0, sizeof(key));
+
+  for (u32 i = 0; i < MAX_RENDER_TARGETS; i++)
+  {
+    if (config.color_formats[i] == GPUTextureFormat::Unknown)
+      break;
+
+    key.color[i].format = static_cast<u8>(config.color_formats[i]);
+    key.color[i].load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+    key.color[i].store_op = VK_ATTACHMENT_STORE_OP_STORE;
+  }
+
+  if (config.depth_format != GPUTextureFormat::Unknown)
+  {
+    key.depth_format = static_cast<u8>(config.depth_format);
+    key.depth_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+    key.depth_store_op = VK_ATTACHMENT_STORE_OP_STORE;
+
+    const bool stencil = GPUTexture::IsDepthStencilFormat(config.depth_format);
+    key.stencil_load_op = stencil ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    key.stencil_store_op = stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+  }
+
+  key.samples = config.rasterization.multisamples;
+  key.feedback_loop = config.render_pass_flags;
+
+  const auto it = m_render_pass_cache.find(key);
+  return (it != m_render_pass_cache.end()) ? it->second : CreateCachedRenderPass(key);
+}
+
+VkRenderPass VulkanDevice::GetRenderPass(VulkanTexture* const* rts, u32 num_rts, VulkanTexture* ds,
+                                         GPUPipeline::RenderPassFlag feedback_loop)
+{
+  RenderPassCacheKey key;
+  std::memset(&key, 0, sizeof(key));
+
+  static_assert(static_cast<u8>(GPUTextureFormat::Unknown) == 0);
+
+  for (u32 i = 0; i < num_rts; i++)
+  {
+    key.color[i].format = static_cast<u8>(rts[i]->GetFormat());
+    key.color[i].load_op = GetLoadOpForTexture(rts[i]);
+    key.color[i].store_op = VK_ATTACHMENT_STORE_OP_STORE;
+    key.samples = static_cast<u8>(rts[i]->GetSamples());
+  }
+
+  if (ds)
+  {
+    const VkAttachmentLoadOp load_op = GetLoadOpForTexture(ds);
+    key.depth_format = static_cast<u8>(ds->GetFormat());
+    key.depth_load_op = load_op;
+    key.depth_store_op = VK_ATTACHMENT_STORE_OP_STORE;
+
+    const bool stencil = GPUTexture::IsDepthStencilFormat(ds->GetFormat());
+    key.stencil_load_op = stencil ? load_op : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    key.stencil_store_op = stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+
+    key.samples = static_cast<u8>(ds->GetSamples());
+  }
+
+  key.feedback_loop = feedback_loop;
+
+  const auto it = m_render_pass_cache.find(key);
+  return (it != m_render_pass_cache.end()) ? it->second : CreateCachedRenderPass(key);
+}
+
+VkRenderPass VulkanDevice::GetSwapChainRenderPass(GPUTextureFormat format, VkAttachmentLoadOp load_op)
+{
+  DebugAssert(format != GPUTextureFormat::Unknown);
+
+  RenderPassCacheKey key;
+  std::memset(&key, 0, sizeof(key));
+
+  key.color[0].format = static_cast<u8>(format);
+  key.color[0].load_op = load_op;
+  key.color[0].store_op = VK_ATTACHMENT_STORE_OP_STORE;
+  key.samples = 1;
+
+  const auto it = m_render_pass_cache.find(key);
+  return (it != m_render_pass_cache.end()) ? it->second : CreateCachedRenderPass(key);
 }
 
 VkRenderPass VulkanDevice::GetRenderPassForRestarting(VkRenderPass pass)
@@ -830,19 +967,22 @@ VkRenderPass VulkanDevice::GetRenderPassForRestarting(VkRenderPass pass)
     if (it.second != pass)
       continue;
 
-    RenderPassCacheKey modified_key;
-    modified_key.key = it.first;
-    if (modified_key.color_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
-      modified_key.color_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+    RenderPassCacheKey modified_key = it.first;
+    for (u32 i = 0; i < MAX_RENDER_TARGETS; i++)
+    {
+      if (modified_key.color[i].load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
+        modified_key.color[i].load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
+    }
+
     if (modified_key.depth_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
       modified_key.depth_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
     if (modified_key.stencil_load_op == VK_ATTACHMENT_LOAD_OP_CLEAR)
       modified_key.stencil_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
 
-    if (modified_key.key == it.first)
+    if (modified_key == it.first)
       return pass;
 
-    auto fit = m_render_pass_cache.find(modified_key.key);
+    auto fit = m_render_pass_cache.find(modified_key);
     if (fit != m_render_pass_cache.end())
       return fit->second;
 
@@ -868,8 +1008,9 @@ VkCommandBuffer VulkanDevice::GetCurrentInitCommandBuffer()
 
 VkDescriptorSet VulkanDevice::AllocateDescriptorSet(VkDescriptorSetLayout set_layout)
 {
+  CommandBuffer& fres = m_frame_resources[m_current_frame];
   VkDescriptorSetAllocateInfo allocate_info = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, nullptr,
-                                               m_frame_resources[m_current_frame].descriptor_pool, 1, &set_layout};
+                                               fres.descriptor_pool, 1, &set_layout};
 
   VkDescriptorSet descriptor_set;
   VkResult res = vkAllocateDescriptorSets(m_device, &allocate_info, &descriptor_set);
@@ -880,6 +1021,7 @@ VkDescriptorSet VulkanDevice::AllocateDescriptorSet(VkDescriptorSetLayout set_la
     return VK_NULL_HANDLE;
   }
 
+  fres.needs_descriptor_pool_reset = true;
   return descriptor_set;
 }
 
@@ -920,10 +1062,14 @@ void VulkanDevice::WaitForFenceCounter(u64 fence_counter)
   WaitForCommandBufferCompletion(index);
 }
 
-void VulkanDevice::WaitForGPUIdle()
+void VulkanDevice::WaitForAllFences()
 {
-  WaitForPresentComplete();
-  vkDeviceWaitIdle(m_device);
+  u32 index = (m_current_frame + 1) % NUM_COMMAND_BUFFERS;
+  for (u32 i = 0; i < (NUM_COMMAND_BUFFERS - 1); i++)
+  {
+    WaitForCommandBufferCompletion(index);
+    index = (index + 1) % NUM_COMMAND_BUFFERS;
+  }
 }
 
 float VulkanDevice::GetAndResetAccumulatedGPUTime()
@@ -941,13 +1087,29 @@ bool VulkanDevice::SetGPUTimingEnabled(bool enabled)
 
 void VulkanDevice::WaitForCommandBufferCompletion(u32 index)
 {
-  // Wait for this command buffer to be completed.
-  VkResult res = vkWaitForFences(m_device, 1, &m_frame_resources[index].fence, VK_TRUE, UINT64_MAX);
-  if (res != VK_SUCCESS)
-  {
-    LOG_VULKAN_ERROR(res, "vkWaitForFences failed: ");
-    m_last_submit_failed.store(true, std::memory_order_release);
+  if (m_device_was_lost)
     return;
+
+  // Wait for this command buffer to be completed.
+  static constexpr u32 MAX_TIMEOUTS = 10;
+  u32 timeouts = 0;
+  for (;;)
+  {
+    VkResult res = vkWaitForFences(m_device, 1, &m_frame_resources[index].fence, VK_TRUE, UINT64_MAX);
+    if (res == VK_SUCCESS)
+      break;
+
+    if (res == VK_TIMEOUT && (++timeouts) <= MAX_TIMEOUTS)
+    {
+      ERROR_LOG("vkWaitForFences() for cmdbuffer {} failed with VK_TIMEOUT, trying again.", index);
+      continue;
+    }
+    else if (res != VK_SUCCESS)
+    {
+      LOG_VULKAN_ERROR(res, TinyString::from_format("vkWaitForFences() for cmdbuffer {} failed: ", index));
+      m_device_was_lost = true;
+      return;
+    }
   }
 
   // Clean up any resources for command buffers between the last known completed buffer and this
@@ -963,8 +1125,8 @@ void VulkanDevice::WaitForCommandBufferCompletion(u32 index)
     if (m_gpu_timing_enabled && resources.timestamp_written)
     {
       std::array<u64, 2> timestamps;
-      res =
-        vkGetQueryPoolResults(m_device, m_timestamp_query_pool, index * 2, static_cast<u32>(timestamps.size()),
+      VkResult res =
+        vkGetQueryPoolResults(m_device, m_timestamp_query_pool, cleanup_index * 2, static_cast<u32>(timestamps.size()),
                               sizeof(u64) * timestamps.size(), timestamps.data(), sizeof(u64), VK_QUERY_RESULT_64_BIT);
       if (res == VK_SUCCESS)
       {
@@ -997,11 +1159,24 @@ void VulkanDevice::WaitForCommandBufferCompletion(u32 index)
   }
 }
 
-void VulkanDevice::SubmitCommandBuffer(VulkanSwapChain* present_swap_chain /* = nullptr */,
-                                       bool submit_on_thread /* = false */)
+void VulkanDevice::EndAndSubmitCommandBuffer(bool wait_for_completion, VulkanSwapChain* present_swap_chain,
+                                             bool explicit_present)
 {
-  if (m_last_submit_failed.load(std::memory_order_acquire))
+  if (m_device_was_lost) [[unlikely]]
     return;
+
+  VkCommandBuffer buffers[2];
+  VkSubmitInfo submit_info = {
+    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+    .pNext = nullptr,
+    .waitSemaphoreCount = 0u,
+    .pWaitSemaphores = nullptr,
+    .pWaitDstStageMask = nullptr,
+    .commandBufferCount = 0,
+    .pCommandBuffers = buffers,
+    .signalSemaphoreCount = 0u,
+    .pSignalSemaphores = nullptr,
+  };
 
   CommandBuffer& resources = m_frame_resources[m_current_frame];
 
@@ -1009,6 +1184,11 @@ void VulkanDevice::SubmitCommandBuffer(VulkanSwapChain* present_swap_chain /* = 
   VkResult res;
   if (resources.init_buffer_used)
   {
+    resources.init_buffer_used = false;
+
+    buffers[0] = resources.command_buffers[0];
+    submit_info.commandBufferCount = 1;
+
     res = vkEndCommandBuffer(resources.command_buffers[0]);
     if (res != VK_SUCCESS)
     {
@@ -1030,159 +1210,89 @@ void VulkanDevice::SubmitCommandBuffer(VulkanSwapChain* present_swap_chain /* = 
     Panic("Failed to end command buffer");
   }
 
-  // This command buffer now has commands, so can't be re-used without waiting.
-  resources.needs_fence_wait = true;
+  buffers[submit_info.commandBufferCount++] = resources.command_buffers[1];
 
-  std::unique_lock<std::mutex> lock(m_present_mutex);
-  WaitForPresentComplete(lock);
-
-  if (!submit_on_thread || !m_present_thread.joinable())
-  {
-    DoSubmitCommandBuffer(m_current_frame, present_swap_chain);
-    if (present_swap_chain)
-      DoPresent(present_swap_chain);
-    return;
-  }
-
-  m_queued_present.command_buffer_index = m_current_frame;
-  m_queued_present.swap_chain = present_swap_chain;
-  m_present_done.store(false);
-  m_present_queued_cv.notify_one();
-}
-
-void VulkanDevice::DoSubmitCommandBuffer(u32 index, VulkanSwapChain* present_swap_chain)
-{
-  CommandBuffer& resources = m_frame_resources[index];
-
-  uint32_t wait_bits = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-  VkSubmitInfo submit_info = {VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                              nullptr,
-                              0u,
-                              nullptr,
-                              nullptr,
-                              resources.init_buffer_used ? 2u : 1u,
-                              resources.init_buffer_used ? resources.command_buffers.data() :
-                                                           &resources.command_buffers[1],
-                              0u,
-                              nullptr};
-
+  uint32_t wait_bits;
   if (present_swap_chain)
   {
-    submit_info.pWaitSemaphores = present_swap_chain->GetImageAvailableSemaphorePtr();
+    wait_bits = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+    submit_info.pWaitSemaphores = present_swap_chain->GetImageAcquireSemaphorePtr();
     submit_info.waitSemaphoreCount = 1;
     submit_info.pWaitDstStageMask = &wait_bits;
 
-    submit_info.pSignalSemaphores = present_swap_chain->GetRenderingFinishedSemaphorePtr();
+    submit_info.pSignalSemaphores = present_swap_chain->GetPresentSemaphorePtr();
     submit_info.signalSemaphoreCount = 1;
   }
 
-  const VkResult res = vkQueueSubmit(m_graphics_queue, 1, &submit_info, resources.fence);
+  res = vkQueueSubmit(m_graphics_queue, 1, &submit_info, resources.fence);
   if (res != VK_SUCCESS)
   {
     LOG_VULKAN_ERROR(res, "vkQueueSubmit failed: ");
-    m_last_submit_failed.store(true, std::memory_order_release);
+    m_device_was_lost = true;
     return;
+  }
+
+  if (present_swap_chain && !explicit_present)
+    QueuePresent(present_swap_chain);
+
+  // Wait before if the next command buffer has not already been waited for.
+  // Waiting afterwards ends up slightly faster because we can do the resets and such before blocking on the
+  // fence wait, but only if the next buffer is definitely not in use. Otherwise we'll do 2 fence waits.
+  const u32 next_command_buffer_index = (m_current_frame + 1) % NUM_COMMAND_BUFFERS;
+  if (wait_for_completion)
+  {
+    const u32 current_command_buffer_index = m_current_frame;
+    if (m_completed_fence_counter >= m_frame_resources[next_command_buffer_index].fence_counter)
+    {
+      BeginCommandBuffer(next_command_buffer_index);
+      WaitForCommandBufferCompletion(current_command_buffer_index);
+    }
+    else
+    {
+      WaitForCommandBufferCompletion(current_command_buffer_index);
+      BeginCommandBuffer(next_command_buffer_index);
+    }
+  }
+  else
+  {
+    BeginCommandBuffer(next_command_buffer_index);
   }
 }
 
-void VulkanDevice::DoPresent(VulkanSwapChain* present_swap_chain)
+void VulkanDevice::QueuePresent(VulkanSwapChain* present_swap_chain)
 {
   const VkPresentInfoKHR present_info = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
                                          nullptr,
                                          1,
-                                         present_swap_chain->GetRenderingFinishedSemaphorePtr(),
+                                         present_swap_chain->GetPresentSemaphorePtr(),
                                          1,
                                          present_swap_chain->GetSwapChainPtr(),
                                          present_swap_chain->GetCurrentImageIndexPtr(),
                                          nullptr};
 
-  present_swap_chain->ReleaseCurrentImage();
+  present_swap_chain->ResetImageAcquireResult();
 
   const VkResult res = vkQueuePresentKHR(m_present_queue, &present_info);
   if (res != VK_SUCCESS)
   {
-    // VK_ERROR_OUT_OF_DATE_KHR is not fatal, just means we need to recreate our swap chain.
-    if (res != VK_ERROR_OUT_OF_DATE_KHR && res != VK_SUBOPTIMAL_KHR)
+    VkResult handled_res = res;
+    if (!present_swap_chain->HandleAcquireOrPresentError(handled_res))
+    {
       LOG_VULKAN_ERROR(res, "vkQueuePresentKHR failed: ");
-
-    m_last_present_failed.store(true, std::memory_order_release);
-    return;
+      return;
+    }
   }
 
   // Grab the next image as soon as possible, that way we spend less time blocked on the next
   // submission. Don't care if it fails, we'll deal with that at the presentation call site.
   // Credit to dxvk for the idea.
-  present_swap_chain->AcquireNextImage();
-}
-
-void VulkanDevice::WaitForPresentComplete()
-{
-  if (m_present_done.load())
-    return;
-
-  std::unique_lock<std::mutex> lock(m_present_mutex);
-  WaitForPresentComplete(lock);
-}
-
-void VulkanDevice::WaitForPresentComplete(std::unique_lock<std::mutex>& lock)
-{
-  if (m_present_done.load())
-    return;
-
-  m_present_done_cv.wait(lock, [this]() { return m_present_done.load(); });
-}
-
-void VulkanDevice::PresentThread()
-{
-  std::unique_lock<std::mutex> lock(m_present_mutex);
-  while (!m_present_thread_done.load())
-  {
-    m_present_queued_cv.wait(lock, [this]() { return !m_present_done.load() || m_present_thread_done.load(); });
-
-    if (m_present_done.load())
-      continue;
-
-    DoSubmitCommandBuffer(m_queued_present.command_buffer_index, m_queued_present.swap_chain);
-    if (m_queued_present.swap_chain)
-      DoPresent(m_queued_present.swap_chain);
-    m_present_done.store(true);
-    m_present_done_cv.notify_one();
-  }
-}
-
-void VulkanDevice::StartPresentThread()
-{
-  DebugAssert(!m_present_thread.joinable());
-  m_present_thread_done.store(false);
-  m_present_thread = std::thread(&VulkanDevice::PresentThread, this);
-}
-
-void VulkanDevice::StopPresentThread()
-{
-  if (!m_present_thread.joinable())
-    return;
-
-  {
-    std::unique_lock<std::mutex> lock(m_present_mutex);
-    WaitForPresentComplete(lock);
-    m_present_thread_done.store(true);
-    m_present_queued_cv.notify_one();
-  }
-
-  m_present_thread.join();
-}
-
-void VulkanDevice::MoveToNextCommandBuffer()
-{
-  BeginCommandBuffer((m_current_frame + 1) % NUM_COMMAND_BUFFERS);
+  present_swap_chain->AcquireNextImage(false);
 }
 
 void VulkanDevice::BeginCommandBuffer(u32 index)
 {
   CommandBuffer& resources = m_frame_resources[index];
-
-  if (!m_present_done.load() && m_queued_present.command_buffer_index == index)
-    WaitForPresentComplete();
 
   // Wait for the GPU to finish with all resources for this command buffer.
   if (resources.fence_counter > m_completed_fence_counter)
@@ -1206,8 +1316,9 @@ void VulkanDevice::BeginCommandBuffer(u32 index)
     LOG_VULKAN_ERROR(res, "vkBeginCommandBuffer failed: ");
 
   // Also can do the same for the descriptor pools
-  if (resources.descriptor_pool != VK_NULL_HANDLE)
+  if (resources.needs_descriptor_pool_reset)
   {
+    resources.needs_descriptor_pool_reset = false;
     res = vkResetDescriptorPool(m_device, resources.descriptor_pool, 0);
     if (res != VK_SUCCESS)
       LOG_VULKAN_ERROR(res, "vkResetDescriptorPool failed: ");
@@ -1220,8 +1331,8 @@ void VulkanDevice::BeginCommandBuffer(u32 index)
                         index * 2);
   }
 
+  DebugAssert(!resources.init_buffer_used);
   resources.fence_counter = m_next_fence_counter++;
-  resources.init_buffer_used = false;
   resources.timestamp_written = m_gpu_timing_enabled;
 
   m_current_frame = index;
@@ -1233,58 +1344,40 @@ void VulkanDevice::BeginCommandBuffer(u32 index)
 
 void VulkanDevice::SubmitCommandBuffer(bool wait_for_completion)
 {
-  DebugAssert(!InRenderPass());
+  if (InRenderPass())
+    EndRenderPass();
 
-  const u32 current_frame = m_current_frame;
-  SubmitCommandBuffer();
-  MoveToNextCommandBuffer();
-
-  if (wait_for_completion)
-    WaitForCommandBufferCompletion(current_frame);
+  EndAndSubmitCommandBuffer(wait_for_completion, nullptr, false);
 
   InvalidateCachedState();
 }
 
-void VulkanDevice::SubmitCommandBuffer(bool wait_for_completion, const char* reason, ...)
+void VulkanDevice::SubmitCommandBuffer(bool wait_for_completion, const std::string_view reason)
 {
-  std::va_list ap;
-  va_start(ap, reason);
-  const std::string reason_str(StringUtil::StdStringFromFormatV(reason, ap));
-  va_end(ap);
+  WARNING_LOG("Executing command buffer due to '{}'", reason);
 
-  Log_WarningPrintf("Executing command buffer due to '%s'", reason_str.c_str());
   SubmitCommandBuffer(wait_for_completion);
 }
 
-void VulkanDevice::SubmitCommandBufferAndRestartRenderPass(const char* reason)
+void VulkanDevice::SubmitCommandBufferAndRestartRenderPass(const std::string_view reason)
 {
-  if (InRenderPass())
-    EndRenderPass();
+  SubmitCommandBuffer(false, reason);
 
-  VulkanFramebuffer* fb = m_current_framebuffer;
-  VulkanPipeline* pl = m_current_pipeline;
-  SubmitCommandBuffer(false, "%s", reason);
-
-  if (fb)
-    SetFramebuffer(fb);
-  SetPipeline(pl);
   BeginRenderPass();
-}
-
-bool VulkanDevice::CheckLastPresentFail()
-{
-  return m_last_present_failed.exchange(false, std::memory_order_acq_rel);
-}
-
-bool VulkanDevice::CheckLastSubmitFail()
-{
-  return m_last_submit_failed.load(std::memory_order_acquire);
 }
 
 void VulkanDevice::DeferBufferDestruction(VkBuffer object, VmaAllocation allocation)
 {
   m_cleanup_objects.emplace_back(GetCurrentFenceCounter(),
                                  [this, object, allocation]() { vmaDestroyBuffer(m_allocator, object, allocation); });
+}
+
+void VulkanDevice::DeferBufferDestruction(VkBuffer object, VkDeviceMemory memory)
+{
+  m_cleanup_objects.emplace_back(GetCurrentFenceCounter(), [this, object, memory]() {
+    vkDestroyBuffer(m_device, object, nullptr);
+    vkFreeMemory(m_device, memory, nullptr);
+  });
 }
 
 void VulkanDevice::DeferFramebufferDestruction(VkFramebuffer object)
@@ -1322,81 +1415,15 @@ void VulkanDevice::DeferPersistentDescriptorSetDestruction(VkDescriptorSet objec
   m_cleanup_objects.emplace_back(GetCurrentFenceCounter(), [this, object]() { FreePersistentDescriptorSet(object); });
 }
 
-VKAPI_ATTR VkBool32 VKAPI_CALL DebugMessengerCallback(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
-                                                      VkDebugUtilsMessageTypeFlagsEXT messageType,
-                                                      const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
-                                                      void* pUserData)
+void VulkanDevice::DeferSamplerDestruction(VkSampler object)
 {
-  if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
-  {
-    Log_ErrorPrintf("Vulkan debug report: (%s) %s", pCallbackData->pMessageIdName ? pCallbackData->pMessageIdName : "",
-                    pCallbackData->pMessage);
-  }
-  else if (severity & (VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT))
-  {
-    Log_WarningPrintf("Vulkan debug report: (%s) %s",
-                      pCallbackData->pMessageIdName ? pCallbackData->pMessageIdName : "", pCallbackData->pMessage);
-  }
-  else if (severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT)
-  {
-    Log_InfoPrintf("Vulkan debug report: (%s) %s", pCallbackData->pMessageIdName ? pCallbackData->pMessageIdName : "",
-                   pCallbackData->pMessage);
-  }
-  else
-  {
-    Log_DevPrintf("Vulkan debug report: (%s) %s", pCallbackData->pMessageIdName ? pCallbackData->pMessageIdName : "",
-                  pCallbackData->pMessage);
-  }
-
-  return VK_FALSE;
-}
-
-bool VulkanDevice::EnableDebugUtils()
-{
-  // Already enabled?
-  if (m_debug_messenger_callback != VK_NULL_HANDLE)
-    return true;
-
-  // Check for presence of the functions before calling
-  if (!vkCreateDebugUtilsMessengerEXT || !vkDestroyDebugUtilsMessengerEXT || !vkSubmitDebugUtilsMessageEXT)
-  {
-    return false;
-  }
-
-  VkDebugUtilsMessengerCreateInfoEXT messenger_info = {
-    VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-    nullptr,
-    0,
-    VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
-      VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT,
-    VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT |
-      VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT,
-    DebugMessengerCallback,
-    nullptr};
-
-  const VkResult res =
-    vkCreateDebugUtilsMessengerEXT(m_instance, &messenger_info, nullptr, &m_debug_messenger_callback);
-  if (res != VK_SUCCESS)
-  {
-    LOG_VULKAN_ERROR(res, "vkCreateDebugUtilsMessengerEXT failed: ");
-    return false;
-  }
-
-  return true;
-}
-
-void VulkanDevice::DisableDebugUtils()
-{
-  if (m_debug_messenger_callback != VK_NULL_HANDLE)
-  {
-    vkDestroyDebugUtilsMessengerEXT(m_instance, m_debug_messenger_callback, nullptr);
-    m_debug_messenger_callback = VK_NULL_HANDLE;
-  }
+  m_cleanup_objects.emplace_back(GetCurrentFenceCounter(),
+                                 [this, object]() { vkDestroySampler(m_device, object, nullptr); });
 }
 
 VkRenderPass VulkanDevice::CreateCachedRenderPass(RenderPassCacheKey key)
 {
-  VkAttachmentReference color_reference;
+  std::array<VkAttachmentReference, MAX_RENDER_TARGETS> color_references;
   VkAttachmentReference* color_reference_ptr = nullptr;
   VkAttachmentReference depth_reference;
   VkAttachmentReference* depth_reference_ptr = nullptr;
@@ -1404,35 +1431,40 @@ VkRenderPass VulkanDevice::CreateCachedRenderPass(RenderPassCacheKey key)
   VkAttachmentReference* input_reference_ptr = nullptr;
   VkSubpassDependency subpass_dependency;
   VkSubpassDependency* subpass_dependency_ptr = nullptr;
-  std::array<VkAttachmentDescription, 2> attachments;
+  std::array<VkAttachmentDescription, MAX_RENDER_TARGETS + 1> attachments;
   u32 num_attachments = 0;
-  if (key.color_format != VK_FORMAT_UNDEFINED)
+
+  for (u32 i = 0; i < MAX_RENDER_TARGETS; i++)
   {
+    if (key.color[i].format == static_cast<u8>(GPUTextureFormat::Unknown))
+      break;
+
     const VkImageLayout layout =
-      key.color_feedback_loop ?
-        (UseFeedbackLoopLayout() ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT : VK_IMAGE_LAYOUT_GENERAL) :
+      (key.feedback_loop & GPUPipeline::ColorFeedbackLoop) ?
+        (m_optional_extensions.vk_khr_dynamic_rendering_local_read ? VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR :
+                                                                     VK_IMAGE_LAYOUT_GENERAL) :
         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    attachments[num_attachments] = {0,
-                                    static_cast<VkFormat>(key.color_format),
+
+    const RenderPassCacheKey::RenderTarget key_rt = key.color[i];
+    attachments[num_attachments] = {i,
+                                    TEXTURE_FORMAT_MAPPING[key_rt.format],
                                     static_cast<VkSampleCountFlagBits>(key.samples),
-                                    static_cast<VkAttachmentLoadOp>(key.color_load_op),
-                                    static_cast<VkAttachmentStoreOp>(key.color_store_op),
+                                    static_cast<VkAttachmentLoadOp>(key_rt.load_op),
+                                    static_cast<VkAttachmentStoreOp>(key_rt.store_op),
                                     VK_ATTACHMENT_LOAD_OP_DONT_CARE,
                                     VK_ATTACHMENT_STORE_OP_DONT_CARE,
                                     layout,
                                     layout};
-    color_reference.attachment = num_attachments;
-    color_reference.layout = layout;
-    color_reference_ptr = &color_reference;
+    color_references[num_attachments].attachment = num_attachments;
+    color_references[num_attachments].layout = layout;
+    color_reference_ptr = color_references.data();
 
-    if (key.color_feedback_loop)
+    if (key.feedback_loop & GPUPipeline::ColorFeedbackLoop)
     {
-      if (!UseFeedbackLoopLayout())
-      {
-        input_reference.attachment = num_attachments;
-        input_reference.layout = layout;
-        input_reference_ptr = &input_reference;
-      }
+      DebugAssert(i == 0);
+      input_reference.attachment = num_attachments;
+      input_reference.layout = layout;
+      input_reference_ptr = &input_reference;
 
       if (!m_optional_extensions.vk_ext_rasterization_order_attachment_access)
       {
@@ -1442,25 +1474,24 @@ VkRenderPass VulkanDevice::CreateCachedRenderPass(RenderPassCacheKey key)
         subpass_dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         subpass_dependency.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
         subpass_dependency.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-        subpass_dependency.dstAccessMask =
-          UseFeedbackLoopLayout() ? VK_ACCESS_SHADER_READ_BIT : VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
-        subpass_dependency.dependencyFlags = UseFeedbackLoopLayout() ?
-                                               (VK_DEPENDENCY_BY_REGION_BIT | VK_DEPENDENCY_FEEDBACK_LOOP_BIT_EXT) :
-                                               VK_DEPENDENCY_BY_REGION_BIT;
+        subpass_dependency.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+        subpass_dependency.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
         subpass_dependency_ptr = &subpass_dependency;
       }
     }
 
     num_attachments++;
   }
-  if (key.depth_format != VK_FORMAT_UNDEFINED)
+
+  const u32 num_rts = num_attachments;
+
+  if (key.depth_format != static_cast<u8>(GPUTextureFormat::Unknown))
   {
-    const VkImageLayout layout =
-      key.depth_sampling ?
-        (UseFeedbackLoopLayout() ? VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT : VK_IMAGE_LAYOUT_GENERAL) :
-        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    const VkImageLayout layout = (key.feedback_loop & GPUPipeline::SampleDepthBuffer) ?
+                                   VK_IMAGE_LAYOUT_GENERAL :
+                                   VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     attachments[num_attachments] = {0,
-                                    static_cast<VkFormat>(key.depth_format),
+                                    static_cast<VkFormat>(TEXTURE_FORMAT_MAPPING[key.depth_format]),
                                     static_cast<VkSampleCountFlagBits>(key.samples),
                                     static_cast<VkAttachmentLoadOp>(key.depth_load_op),
                                     static_cast<VkAttachmentStoreOp>(key.depth_store_op),
@@ -1475,15 +1506,16 @@ VkRenderPass VulkanDevice::CreateCachedRenderPass(RenderPassCacheKey key)
   }
 
   const VkSubpassDescriptionFlags subpass_flags =
-    (key.color_feedback_loop && m_optional_extensions.vk_ext_rasterization_order_attachment_access) ?
+    ((key.feedback_loop & GPUPipeline::ColorFeedbackLoop) &&
+     m_optional_extensions.vk_ext_rasterization_order_attachment_access) ?
       VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT :
       0;
   const VkSubpassDescription subpass = {subpass_flags,
                                         VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                        input_reference_ptr ? 1u : 0u,
-                                        input_reference_ptr ? input_reference_ptr : nullptr,
-                                        color_reference_ptr ? 1u : 0u,
-                                        color_reference_ptr ? color_reference_ptr : nullptr,
+                                        input_reference_ptr ? num_rts : 0u,
+                                        input_reference_ptr,
+                                        num_rts,
+                                        color_reference_ptr,
                                         nullptr,
                                         depth_reference_ptr,
                                         0,
@@ -1506,208 +1538,100 @@ VkRenderPass VulkanDevice::CreateCachedRenderPass(RenderPassCacheKey key)
     return VK_NULL_HANDLE;
   }
 
-  m_render_pass_cache.emplace(key.key, pass);
+  m_render_pass_cache.emplace(key, pass);
   return pass;
 }
 
-void VulkanDevice::GetAdapterAndModeList(AdapterAndModeList* ret, VkInstance instance)
+VkFramebuffer VulkanDevice::CreateFramebuffer(GPUTexture* const* rts, u32 num_rts, GPUTexture* ds, u32 flags)
 {
-  GPUList gpus = EnumerateGPUs(instance);
-  ret->adapter_names.clear();
-  for (auto& [gpu, name] : gpus)
-    ret->adapter_names.push_back(std::move(name));
+  VulkanDevice& dev = VulkanDevice::GetInstance();
+  VkRenderPass render_pass =
+    dev.GetRenderPass(reinterpret_cast<VulkanTexture* const*>(rts), num_rts, static_cast<VulkanTexture*>(ds),
+                      static_cast<GPUPipeline::RenderPassFlag>(flags));
+
+  const GPUTexture* rt_or_ds = (num_rts > 0) ? rts[0] : ds;
+  DebugAssert(rt_or_ds);
+
+  Vulkan::FramebufferBuilder fbb;
+  fbb.SetRenderPass(render_pass);
+  fbb.SetSize(rt_or_ds->GetWidth(), rt_or_ds->GetHeight(), 1);
+  for (u32 i = 0; i < num_rts; i++)
+    fbb.AddAttachment(static_cast<VulkanTexture*>(rts[i])->GetView());
+  if (ds)
+    fbb.AddAttachment(static_cast<VulkanTexture*>(ds)->GetView());
+
+  return fbb.Create(dev.m_device, false);
 }
 
-GPUDevice::AdapterAndModeList VulkanDevice::StaticGetAdapterAndModeList()
+void VulkanDevice::DestroyFramebuffer(VkFramebuffer fbo)
 {
-  AdapterAndModeList ret;
-  std::unique_lock lock(s_instance_mutex);
+  if (fbo == VK_NULL_HANDLE)
+    return;
 
-  // Device shouldn't be torn down since we have the lock.
-  if (g_gpu_device && g_gpu_device->GetRenderAPI() == RenderAPI::Vulkan && Vulkan::IsVulkanLibraryLoaded())
-  {
-    GetAdapterAndModeList(&ret, VulkanDevice::GetInstance().m_instance);
-  }
-  else
-  {
-    if (Vulkan::LoadVulkanLibrary())
-    {
-      ScopedGuard lib_guard([]() { Vulkan::UnloadVulkanLibrary(); });
-      const VkInstance instance = CreateVulkanInstance(WindowInfo(), false, false);
-      if (instance != VK_NULL_HANDLE)
-      {
-        if (Vulkan::LoadVulkanInstanceFunctions(instance))
-          GetAdapterAndModeList(&ret, instance);
-
-        vkDestroyInstance(instance, nullptr);
-      }
-    }
-  }
-
-  return ret;
+  VulkanDevice::GetInstance().DeferFramebufferDestruction(fbo);
 }
 
-GPUDevice::AdapterAndModeList VulkanDevice::GetAdapterAndModeList()
+bool VulkanDevice::CreateDeviceAndMainSwapChain(std::string_view adapter, CreateFlags create_flags,
+                                                const WindowInfo& wi, GPUVSyncMode vsync_mode,
+                                                const ExclusiveFullscreenMode* exclusive_fullscreen_mode,
+                                                std::optional<bool> exclusive_fullscreen_control, Error* error)
 {
-  AdapterAndModeList ret;
-  GetAdapterAndModeList(&ret, m_instance);
-  return ret;
-}
-
-bool VulkanDevice::IsSuitableDefaultRenderer()
-{
-#ifdef __ANDROID__
-  // No way in hell.
-  return false;
-#else
-  AdapterAndModeList aml = StaticGetAdapterAndModeList();
-  if (aml.adapter_names.empty())
+  if (!VulkanLoader::CreateVulkanInstance(wi.type, &m_debug_device, error))
   {
-    // No adapters, not gonna be able to use VK.
+    Error::AddPrefix(error, "Failed to create Vulkan instance. Does your GPU and/or driver support Vulkan?\n");
     return false;
   }
 
-  // Check the first GPU, should be enough.
-  const std::string& name = aml.adapter_names.front();
-  Log_InfoFmt("Using Vulkan GPU '{}' for automatic renderer check.", name);
-
-  // Any software rendering (LLVMpipe, SwiftShader).
-  if (StringUtil::StartsWithNoCase(name, "llvmpipe") || StringUtil::StartsWithNoCase(name, "SwiftShader"))
-  {
-    Log_InfoPrint("Not using Vulkan for software renderer.");
-    return false;
-  }
-
-  // For Intel, OpenGL usually ends up faster on Linux, because of fbfetch.
-  // Plus, the Ivy Bridge and Haswell drivers are incomplete.
-  if (StringUtil::StartsWithNoCase(name, "Intel"))
-  {
-    Log_InfoPrint("Not using Vulkan for Intel GPU.");
-    return false;
-  }
-
-  Log_InfoPrint("Allowing Vulkan as default renderer.");
-  return true;
-#endif
-}
-
-RenderAPI VulkanDevice::GetRenderAPI() const
-{
-  return RenderAPI::Vulkan;
-}
-
-bool VulkanDevice::HasSurface() const
-{
-  return static_cast<bool>(m_swap_chain);
-}
-
-bool VulkanDevice::CreateDevice(const std::string_view& adapter, bool threaded_presentation,
-                                FeatureMask disabled_features)
-{
-  std::unique_lock lock(s_instance_mutex);
-  bool enable_debug_utils = m_debug_device;
-  bool enable_validation_layer = m_debug_device;
-  std::optional<bool> exclusive_fullscreen_control;
-
-  if (!Vulkan::LoadVulkanLibrary())
-  {
-    Host::ReportErrorAsync("Error", "Failed to load Vulkan library. Does your GPU and/or driver support Vulkan?");
-    return false;
-  }
-
-  m_instance = CreateVulkanInstance(m_window_info, enable_debug_utils, enable_validation_layer);
-  if (m_instance == VK_NULL_HANDLE)
-  {
-    if (enable_debug_utils || enable_validation_layer)
-    {
-      // Try again without the validation layer.
-      enable_debug_utils = false;
-      enable_validation_layer = false;
-      m_instance = CreateVulkanInstance(m_window_info, enable_debug_utils, enable_validation_layer);
-      if (m_instance == VK_NULL_HANDLE)
-      {
-        Host::ReportErrorAsync("Error",
-                               "Failed to create Vulkan instance. Does your GPU and/or driver support Vulkan?");
-        return false;
-      }
-
-      Log_ErrorPrintf("Vulkan validation/debug layers requested but are unavailable. Creating non-debug device.");
-    }
-  }
-
-  if (!Vulkan::LoadVulkanInstanceFunctions(m_instance))
-  {
-    Log_ErrorPrintf("Failed to load Vulkan instance functions");
-    return false;
-  }
-
-  GPUList gpus = EnumerateGPUs(m_instance);
+  const VulkanLoader::GPUList gpus = VulkanLoader::EnumerateGPUs(error);
   if (gpus.empty())
   {
-    Host::ReportErrorAsync("Error", "No physical devices found. Does your GPU and/or driver support Vulkan?");
+    Error::AddPrefix(error, "No physical devices found. Does your GPU and/or driver support Vulkan?\n");
+    VulkanLoader::ReleaseVulkanInstance();
     return false;
   }
 
+  VkPhysicalDevice physical_device = VK_NULL_HANDLE;
   if (!adapter.empty())
   {
     u32 gpu_index = 0;
     for (; gpu_index < static_cast<u32>(gpus.size()); gpu_index++)
     {
-      Log_InfoFmt("GPU {}: {}", gpu_index, gpus[gpu_index].second);
-      if (gpus[gpu_index].second == adapter)
+      INFO_LOG("GPU {}: {}", gpu_index, gpus[gpu_index].second.name);
+      if (gpus[gpu_index].second.name == adapter)
       {
-        m_physical_device = gpus[gpu_index].first;
+        physical_device = gpus[gpu_index].first;
         break;
       }
     }
 
-    if (gpu_index == static_cast<u32>(gpus.size()))
+    if (physical_device == VK_NULL_HANDLE)
     {
-      Log_WarningFmt("Requested GPU '{}' not found, using first ({})", adapter, gpus[0].second);
-      m_physical_device = gpus[0].first;
+      WARNING_LOG("Requested GPU '{}' not found, using first ({})", adapter, gpus[0].second.name);
+      physical_device = gpus[0].first;
     }
   }
   else
   {
-    Log_InfoFmt("No GPU requested, using first ({})", gpus[0].second);
-    m_physical_device = gpus[0].first;
+    INFO_LOG("No GPU requested, using first ({})", gpus[0].second.name);
+    physical_device = gpus[0].first;
   }
 
-  // Read device physical memory properties, we need it for allocating buffers
-  vkGetPhysicalDeviceProperties(m_physical_device, &m_device_properties);
-  m_device_properties.limits.minUniformBufferOffsetAlignment =
-    std::max(m_device_properties.limits.minUniformBufferOffsetAlignment, static_cast<VkDeviceSize>(1));
-  m_device_properties.limits.minTexelBufferOffsetAlignment =
-    std::max(m_device_properties.limits.minTexelBufferOffsetAlignment, static_cast<VkDeviceSize>(1));
-  m_device_properties.limits.optimalBufferCopyOffsetAlignment =
-    std::max(m_device_properties.limits.optimalBufferCopyOffsetAlignment, static_cast<VkDeviceSize>(1));
-  m_device_properties.limits.optimalBufferCopyRowPitchAlignment =
-    std::max(m_device_properties.limits.optimalBufferCopyRowPitchAlignment, static_cast<VkDeviceSize>(1));
-  m_device_properties.limits.bufferImageGranularity =
-    std::max(m_device_properties.limits.bufferImageGranularity, static_cast<VkDeviceSize>(1));
-
-  if (enable_debug_utils)
-    EnableDebugUtils();
-
-  VkSurfaceKHR surface = VK_NULL_HANDLE;
-  ScopedGuard surface_cleanup = [this, &surface]() {
-    if (surface != VK_NULL_HANDLE)
-      vkDestroySurfaceKHR(m_instance, surface, nullptr);
-  };
-  if (m_window_info.type != WindowInfo::Type::Surfaceless)
+  std::unique_ptr<VulkanSwapChain> swap_chain;
+  if (!wi.IsSurfaceless())
   {
-    surface = VulkanSwapChain::CreateVulkanSurface(m_instance, m_physical_device, &m_window_info);
-    if (surface == VK_NULL_HANDLE)
+    swap_chain = std::make_unique<VulkanSwapChain>(wi, vsync_mode, exclusive_fullscreen_control);
+    if (!swap_chain->CreateSurface(physical_device, error))
+    {
+      swap_chain->Destroy(*this, false);
+      VulkanLoader::ReleaseVulkanInstance();
       return false;
+    }
   }
 
   // Attempt to create the device.
-  if (!CreateDevice(surface, enable_validation_layer))
-    return false;
-
-  if (!CheckFeatures(disabled_features))
+  if (!CreateDevice(physical_device, swap_chain ? swap_chain->GetSurface() : VK_NULL_HANDLE, create_flags, error))
   {
-    Host::ReportErrorAsync("Error", "Your GPU does not support the required Vulkan features.");
+    VulkanLoader::ReleaseVulkanInstance();
     return false;
   }
 
@@ -1715,66 +1639,51 @@ bool VulkanDevice::CreateDevice(const std::string_view& adapter, bool threaded_p
   if (!CreateAllocator() || !CreatePersistentDescriptorPool() || !CreateCommandBuffers() || !CreatePipelineLayouts())
     return false;
 
-  if (threaded_presentation)
-    StartPresentThread();
+  m_exclusive_fullscreen_control = exclusive_fullscreen_control;
 
-  if (surface != VK_NULL_HANDLE)
+  if (swap_chain)
   {
-    m_swap_chain = VulkanSwapChain::Create(m_window_info, surface, m_vsync_enabled, exclusive_fullscreen_control);
-    if (!m_swap_chain)
-    {
-      Log_ErrorPrintf("Failed to create swap chain");
+    // Render a frame as soon as possible to clear out whatever was previously being displayed.
+    if (!swap_chain->CreateSwapChain(*this, error) || !swap_chain->CreateSwapChainImages(*this, error))
       return false;
-    }
 
-    // NOTE: This is assigned afterwards, because some platforms can modify the window info (e.g. Metal).
-    m_window_info = m_swap_chain->GetWindowInfo();
+    RenderBlankFrame(swap_chain.get());
+    m_main_swap_chain = std::move(swap_chain);
   }
 
-  surface_cleanup.Cancel();
-
-  // Render a frame as soon as possible to clear out whatever was previously being displayed.
-  if (m_window_info.type != WindowInfo::Type::Surfaceless)
-    RenderBlankFrame();
-
-  if (!CreateNullTexture())
-  {
-    Log_ErrorPrint("Failed to create dummy texture");
+  if (!CreateNullTexture(error))
     return false;
-  }
 
   if (!CreateBuffers() || !CreatePersistentDescriptorSets())
+  {
+    Error::SetStringView(error, "Failed to create buffers/descriptor sets");
     return false;
+  }
 
   return true;
 }
 
 void VulkanDevice::DestroyDevice()
 {
-  std::unique_lock lock(s_instance_mutex);
-
   if (InRenderPass())
     EndRenderPass();
 
   // Don't both submitting the current command buffer, just toss it.
   if (m_device != VK_NULL_HANDLE)
-    WaitForGPUIdle();
+    vkDeviceWaitIdle(m_device);
 
-  StopPresentThread();
-  m_swap_chain.reset();
-
-  if (m_null_texture)
+  if (m_main_swap_chain)
   {
-    m_null_texture->Destroy(false);
-    m_null_texture.reset();
+    // Explicit swap chain destroy, we don't want to execute the current cmdbuffer.
+    static_cast<VulkanSwapChain*>(m_main_swap_chain.get())->Destroy(*this, false);
+    m_main_swap_chain.reset();
   }
+
   for (auto& it : m_cleanup_objects)
     it.second();
   m_cleanup_objects.clear();
-  DestroyDownloadBuffer();
   DestroyPersistentDescriptorSets();
   DestroyBuffers();
-  DestroySamplers();
 
   DestroyPersistentDescriptorPool();
   DestroyPipelineLayouts();
@@ -1795,51 +1704,42 @@ void VulkanDevice::DestroyDevice()
   {
     vkDestroyDevice(m_device, nullptr);
     m_device = VK_NULL_HANDLE;
+    VulkanLoader::ResetDeviceFunctions();
+    VulkanLoader::ReleaseVulkanInstance();
   }
-
-  if (m_debug_messenger_callback != VK_NULL_HANDLE)
-    DisableDebugUtils();
-
-  if (m_instance != VK_NULL_HANDLE)
-  {
-    vkDestroyInstance(m_instance, nullptr);
-    m_instance = VK_NULL_HANDLE;
-  }
-
-  Vulkan::UnloadVulkanLibrary();
 }
 
-bool VulkanDevice::ValidatePipelineCacheHeader(const VK_PIPELINE_CACHE_HEADER& header)
+bool VulkanDevice::ValidatePipelineCacheHeader(const VK_PIPELINE_CACHE_HEADER& header, Error* error)
 {
   if (header.header_length < sizeof(VK_PIPELINE_CACHE_HEADER))
   {
-    Log_ErrorPrintf("Pipeline cache failed validation: Invalid header length");
+    Error::SetStringView(error, "Invalid header length");
     return false;
   }
 
   if (header.header_version != VK_PIPELINE_CACHE_HEADER_VERSION_ONE)
   {
-    Log_ErrorPrintf("Pipeline cache failed validation: Invalid header version");
+    Error::SetStringView(error, "Invalid header version");
     return false;
   }
 
   if (header.vendor_id != m_device_properties.vendorID)
   {
-    Log_ErrorPrintf("Pipeline cache failed validation: Incorrect vendor ID (file: 0x%X, device: 0x%X)",
-                    header.vendor_id, m_device_properties.vendorID);
+    Error::SetStringFmt(error, "Incorrect vendor ID (file: 0x{:X}, device: 0x{:X})", header.vendor_id,
+                        m_device_properties.vendorID);
     return false;
   }
 
   if (header.device_id != m_device_properties.deviceID)
   {
-    Log_ErrorPrintf("Pipeline cache failed validation: Incorrect device ID (file: 0x%X, device: 0x%X)",
-                    header.device_id, m_device_properties.deviceID);
+    Error::SetStringFmt(error, "Incorrect device ID (file: 0x{:X}, device: 0x{:X})", header.device_id,
+                        m_device_properties.deviceID);
     return false;
   }
 
   if (std::memcmp(header.uuid, m_device_properties.pipelineCacheUUID, VK_UUID_SIZE) != 0)
   {
-    Log_ErrorPrintf("Pipeline cache failed validation: Incorrect UUID");
+    Error::SetStringView(error, "Incorrect UUID");
     return false;
   }
 
@@ -1855,43 +1755,46 @@ void VulkanDevice::FillPipelineCacheHeader(VK_PIPELINE_CACHE_HEADER* header)
   std::memcpy(header->uuid, m_device_properties.pipelineCacheUUID, VK_UUID_SIZE);
 }
 
-bool VulkanDevice::ReadPipelineCache(const std::string& filename)
+bool VulkanDevice::ReadPipelineCache(DynamicHeapArray<u8> data, Error* error)
 {
-  std::optional<std::vector<u8>> data;
-
-  auto fp = FileSystem::OpenManagedCFile(filename.c_str(), "rb");
-  if (fp)
+  if (data.size() < sizeof(VK_PIPELINE_CACHE_HEADER))
   {
-    data = FileSystem::ReadBinaryFile(fp.get());
-
-    if (data.has_value())
-    {
-      if (data->size() < sizeof(VK_PIPELINE_CACHE_HEADER))
-      {
-        Log_ErrorPrintf("Pipeline cache at '%s' is too small", filename.c_str());
-        return false;
-      }
-
-      VK_PIPELINE_CACHE_HEADER header;
-      std::memcpy(&header, data->data(), sizeof(header));
-      if (!ValidatePipelineCacheHeader(header))
-        data.reset();
-    }
+    Error::SetStringView(error, "Pipeline cache is too small.");
+    return false;
   }
 
-  const VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0,
-                                     data.has_value() ? data->size() : 0, data.has_value() ? data->data() : nullptr};
+  // alignment reasons...
+  VK_PIPELINE_CACHE_HEADER header;
+  std::memcpy(&header, data.data(), sizeof(header));
+  if (!ValidatePipelineCacheHeader(header, error))
+    return false;
+
+  const VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, data.size(),
+                                     data.data()};
   VkResult res = vkCreatePipelineCache(m_device, &ci, nullptr, &m_pipeline_cache);
   if (res != VK_SUCCESS)
   {
-    LOG_VULKAN_ERROR(res, "vkCreatePipelineCache() failed: ");
+    Vulkan::SetErrorObject(error, "vkCreatePipelineCache() failed: ", res);
     return false;
   }
 
   return true;
 }
 
-bool VulkanDevice::GetPipelineCacheData(DynamicHeapArray<u8>* data)
+bool VulkanDevice::CreatePipelineCache(const std::string& path, Error* error)
+{
+  const VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, 0, nullptr};
+  VkResult res = vkCreatePipelineCache(m_device, &ci, nullptr, &m_pipeline_cache);
+  if (res != VK_SUCCESS)
+  {
+    Vulkan::SetErrorObject(error, "vkCreatePipelineCache() failed: ", res);
+    return false;
+  }
+
+  return true;
+}
+
+bool VulkanDevice::GetPipelineCacheData(DynamicHeapArray<u8>* data, Error* error)
 {
   if (m_pipeline_cache == VK_NULL_HANDLE)
     return false;
@@ -1900,7 +1803,7 @@ bool VulkanDevice::GetPipelineCacheData(DynamicHeapArray<u8>* data)
   VkResult res = vkGetPipelineCacheData(m_device, m_pipeline_cache, &data_size, nullptr);
   if (res != VK_SUCCESS)
   {
-    LOG_VULKAN_ERROR(res, "vkGetPipelineCacheData() failed: ");
+    Vulkan::SetErrorObject(error, "vkGetPipelineCacheData() failed: ", res);
     return false;
   }
 
@@ -1908,7 +1811,7 @@ bool VulkanDevice::GetPipelineCacheData(DynamicHeapArray<u8>* data)
   res = vkGetPipelineCacheData(m_device, m_pipeline_cache, &data_size, data->data());
   if (res != VK_SUCCESS)
   {
-    LOG_VULKAN_ERROR(res, "vkGetPipelineCacheData() (2) failed: ");
+    Vulkan::SetErrorObject(error, "vkGetPipelineCacheData() (2) failed: ", res);
     return false;
   }
 
@@ -1916,73 +1819,29 @@ bool VulkanDevice::GetPipelineCacheData(DynamicHeapArray<u8>* data)
   return true;
 }
 
-bool VulkanDevice::UpdateWindow()
+std::unique_ptr<GPUSwapChain> VulkanDevice::CreateSwapChain(const WindowInfo& wi, GPUVSyncMode vsync_mode,
+                                                            const ExclusiveFullscreenMode* exclusive_fullscreen_mode,
+                                                            std::optional<bool> exclusive_fullscreen_control,
+                                                            Error* error)
 {
-  DestroySurface();
-
-  if (!AcquireWindow(false))
-    return false;
-
-  if (m_window_info.IsSurfaceless())
-    return true;
-
-  // make sure previous frames are presented
-  if (InRenderPass())
-    EndRenderPass();
-  SubmitCommandBuffer(false);
-  WaitForGPUIdle();
-
-  VkSurfaceKHR surface = VulkanSwapChain::CreateVulkanSurface(m_instance, m_physical_device, &m_window_info);
-  if (surface == VK_NULL_HANDLE)
+  std::unique_ptr<VulkanSwapChain> swap_chain =
+    std::make_unique<VulkanSwapChain>(wi, vsync_mode, exclusive_fullscreen_control);
+  if (swap_chain->CreateSurface(m_physical_device, error) && swap_chain->CreateSwapChain(*this, error) &&
+      swap_chain->CreateSwapChainImages(*this, error))
   {
-    Log_ErrorPrintf("Failed to create new surface for swap chain");
-    return false;
+    if (InRenderPass())
+      EndRenderPass();
+    RenderBlankFrame(swap_chain.get());
+  }
+  else
+  {
+    swap_chain.reset();
   }
 
-  // TODO: exclusive fullscreen control
-  m_swap_chain = VulkanSwapChain::Create(m_window_info, surface, m_vsync_enabled, std::nullopt);
-  if (!m_swap_chain)
-  {
-    Log_ErrorPrintf("Failed to create swap chain");
-    VulkanSwapChain::DestroyVulkanSurface(m_instance, &m_window_info, surface);
-    return false;
-  }
-
-  m_window_info = m_swap_chain->GetWindowInfo();
-  RenderBlankFrame();
-  return true;
+  return swap_chain;
 }
 
-void VulkanDevice::ResizeWindow(s32 new_window_width, s32 new_window_height, float new_window_scale)
-{
-  if (m_swap_chain->GetWidth() == static_cast<u32>(new_window_width) &&
-      m_swap_chain->GetHeight() == static_cast<u32>(new_window_height))
-  {
-    // skip unnecessary resizes
-    m_window_info.surface_scale = new_window_scale;
-    return;
-  }
-
-  // make sure previous frames are presented
-  WaitForGPUIdle();
-
-  if (!m_swap_chain->ResizeSwapChain(new_window_width, new_window_height, new_window_scale))
-  {
-    // AcquireNextImage() will fail, and we'll recreate the surface.
-    Log_ErrorPrintf("Failed to resize swap chain. Next present will fail.");
-    return;
-  }
-
-  m_window_info = m_swap_chain->GetWindowInfo();
-}
-
-void VulkanDevice::DestroySurface()
-{
-  WaitForGPUIdle();
-  m_swap_chain.reset();
-}
-
-bool VulkanDevice::SupportsTextureFormat(GPUTexture::Format format) const
+bool VulkanDevice::SupportsTextureFormat(GPUTextureFormat format) const
 {
   return (TEXTURE_FORMAT_MAPPING[static_cast<u8>(format)] != VK_FORMAT_UNDEFINED);
 }
@@ -2013,104 +1872,71 @@ std::string VulkanDevice::GetDriverInfo() const
   return ret;
 }
 
-void VulkanDevice::SetVSync(bool enabled)
+void VulkanDevice::FlushCommands()
 {
-  if (!m_swap_chain || m_vsync_enabled == enabled)
-    return;
-
-  // This swap chain should not be used by the current buffer, thus safe to destroy.
-  WaitForGPUIdle();
-  if (!m_swap_chain->SetVSync(enabled))
-  {
-    // Try switching back to the old mode..
-    if (!m_swap_chain->SetVSync(m_vsync_enabled))
-    {
-      Panic("Failed to reset old vsync mode after failure");
-      m_swap_chain.reset();
-    }
-  }
-
-  m_vsync_enabled = enabled;
+  SubmitCommandBuffer(false);
+  TrimTexturePool();
 }
 
-bool VulkanDevice::BeginPresent(bool frame_skip)
+void VulkanDevice::WaitForGPUIdle()
+{
+  SubmitCommandBuffer(true);
+}
+
+GPUPresentResult VulkanDevice::BeginPresent(GPUSwapChain* swap_chain, u32 clear_color)
 {
   if (InRenderPass())
     EndRenderPass();
 
-  if (frame_skip)
-    return false;
+  if (m_device_was_lost) [[unlikely]]
+    return GPUPresentResult::DeviceLost;
 
-  // If we're running surfaceless, kick the command buffer so we don't run out of descriptors.
-  if (!m_swap_chain)
+  VulkanSwapChain* const SC = static_cast<VulkanSwapChain*>(swap_chain);
+  VkResult res = SC->AcquireNextImage(true);
+
+  // This can happen when multiple resize events happen in quick succession.
+  // In this case, just wait until the next frame to try again.
+  if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
   {
+    // Still submit the command buffer, otherwise we'll end up with several frames waiting.
     SubmitCommandBuffer(false);
-    return false;
+    TrimTexturePool();
+    return GPUPresentResult::SkipPresent;
   }
 
-  // Previous frame needs to be presented before we can acquire the swap chain.
-  WaitForPresentComplete();
-
-  // Check if the device was lost.
-  if (CheckLastSubmitFail())
-  {
-    Panic("Fixme"); // TODO
-    return false;
-  }
-
-  VkResult res = m_swap_chain->AcquireNextImage();
-  if (res != VK_SUCCESS)
-  {
-    m_swap_chain->ReleaseCurrentImage();
-
-    if (res == VK_SUBOPTIMAL_KHR || res == VK_ERROR_OUT_OF_DATE_KHR)
-    {
-      ResizeWindow(0, 0, m_window_info.surface_scale);
-      res = m_swap_chain->AcquireNextImage();
-    }
-    else if (res == VK_ERROR_SURFACE_LOST_KHR)
-    {
-      Log_WarningPrintf("Surface lost, attempting to recreate");
-      if (!m_swap_chain->RecreateSurface(m_window_info))
-      {
-        Log_ErrorPrintf("Failed to recreate surface after loss");
-        SubmitCommandBuffer(false);
-        return false;
-      }
-
-      res = m_swap_chain->AcquireNextImage();
-    }
-
-    // This can happen when multiple resize events happen in quick succession.
-    // In this case, just wait until the next frame to try again.
-    if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
-    {
-      // Still submit the command buffer, otherwise we'll end up with several frames waiting.
-      LOG_VULKAN_ERROR(res, "vkAcquireNextImageKHR() failed: ");
-      SubmitCommandBuffer(false);
-      return false;
-    }
-  }
-
-  BeginSwapChainRenderPass();
-  return true;
+  BeginSwapChainRenderPass(SC, clear_color);
+  return GPUPresentResult::OK;
 }
 
-void VulkanDevice::EndPresent()
+void VulkanDevice::EndPresent(GPUSwapChain* swap_chain, bool explicit_present, u64 present_time)
 {
-  DebugAssert(InRenderPass() && !m_current_framebuffer);
+  VulkanSwapChain* const SC = static_cast<VulkanSwapChain*>(swap_chain);
+
+  DebugAssert(present_time == 0);
+  DebugAssert(InRenderPass() && m_num_current_render_targets == 0 && !m_current_depth_target);
   EndRenderPass();
 
-  VkCommandBuffer cmdbuf = GetCurrentCommandBuffer();
-  VulkanTexture::TransitionSubresourcesToLayout(cmdbuf, m_swap_chain->GetCurrentImage(), GPUTexture::Type::RenderTarget,
-                                                0, 1, 0, 1, VulkanTexture::Layout::ColorAttachment,
-                                                VulkanTexture::Layout::PresentSrc);
-  SubmitCommandBuffer(m_swap_chain.get(), !m_swap_chain->IsPresentModeSynchronizing());
-  MoveToNextCommandBuffer();
+  DebugAssert(SC == m_current_swap_chain);
+  m_current_swap_chain = nullptr;
+
+  VulkanTexture::TransitionSubresourcesToLayout(
+    m_current_command_buffer, SC->GetCurrentImage(), GPUTexture::Type::RenderTarget, 0, 1, 0, 1,
+    VulkanTexture::Layout::ColorAttachment, VulkanTexture::Layout::PresentSrc);
+  EndAndSubmitCommandBuffer(false, SC, explicit_present);
   InvalidateCachedState();
+  TrimTexturePool();
 }
 
-#ifdef _DEBUG
+void VulkanDevice::SubmitPresent(GPUSwapChain* swap_chain)
+{
+  DebugAssert(swap_chain);
+  if (m_device_was_lost) [[unlikely]]
+    return;
+
+  QueuePresent(static_cast<VulkanSwapChain*>(swap_chain));
+}
+
+#ifdef ENABLE_GPU_OBJECT_NAMES
 static std::array<float, 3> Palette(float phase, const std::array<float, 3>& a, const std::array<float, 3>& b,
                                     const std::array<float, 3>& c, const std::array<float, 3>& d)
 {
@@ -2120,11 +1946,9 @@ static std::array<float, 3> Palette(float phase, const std::array<float, 3>& a, 
   result[2] = a[2] + b[2] * std::cos(6.28318f * (c[2] * phase + d[2]));
   return result;
 }
-#endif
 
 void VulkanDevice::PushDebugGroup(const char* name)
 {
-#ifdef _DEBUG
   if (!vkCmdBeginDebugUtilsLabelEXT || !m_debug_device)
     return;
 
@@ -2137,81 +1961,61 @@ void VulkanDevice::PushDebugGroup(const char* name)
     name,
     {color[0], color[1], color[2], 1.0f},
   };
-  vkCmdBeginDebugUtilsLabelEXT(GetCurrentCommandBuffer(), &label);
-#endif
+  vkCmdBeginDebugUtilsLabelEXT(m_current_command_buffer, &label);
 }
 
 void VulkanDevice::PopDebugGroup()
 {
-#ifdef _DEBUG
   if (!vkCmdEndDebugUtilsLabelEXT || !m_debug_device)
     return;
 
   s_debug_scope_depth = (s_debug_scope_depth == 0) ? 0 : (s_debug_scope_depth - 1u);
 
-  vkCmdEndDebugUtilsLabelEXT(GetCurrentCommandBuffer());
-#endif
+  vkCmdEndDebugUtilsLabelEXT(m_current_command_buffer);
 }
 
 void VulkanDevice::InsertDebugMessage(const char* msg)
 {
-#ifdef _DEBUG
   if (!vkCmdInsertDebugUtilsLabelEXT || !m_debug_device)
     return;
 
   const VkDebugUtilsLabelEXT label = {VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT, nullptr, msg, {0.0f, 0.0f, 0.0f, 1.0f}};
-  vkCmdInsertDebugUtilsLabelEXT(GetCurrentCommandBuffer(), &label);
-#endif
+  vkCmdInsertDebugUtilsLabelEXT(m_current_command_buffer, &label);
 }
 
-bool VulkanDevice::CheckFeatures(FeatureMask disabled_features)
-{
-  m_max_texture_size = m_device_properties.limits.maxImageDimension2D;
+#endif
 
-  VkImageFormatProperties color_properties = {};
-  vkGetPhysicalDeviceImageFormatProperties(m_physical_device, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_TYPE_2D,
-                                           VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0,
-                                           &color_properties);
-  VkImageFormatProperties depth_properties = {};
-  vkGetPhysicalDeviceImageFormatProperties(m_physical_device, VK_FORMAT_D32_SFLOAT, VK_IMAGE_TYPE_2D,
-                                           VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,
-                                           &depth_properties);
-  const VkSampleCountFlags combined_properties = m_device_properties.limits.framebufferColorSampleCounts &
-                                                 m_device_properties.limits.framebufferDepthSampleCounts &
-                                                 color_properties.sampleCounts & depth_properties.sampleCounts;
-  if (combined_properties & VK_SAMPLE_COUNT_64_BIT)
-    m_max_multisamples = 64;
-  else if (combined_properties & VK_SAMPLE_COUNT_32_BIT)
-    m_max_multisamples = 32;
-  else if (combined_properties & VK_SAMPLE_COUNT_16_BIT)
-    m_max_multisamples = 16;
-  else if (combined_properties & VK_SAMPLE_COUNT_8_BIT)
-    m_max_multisamples = 8;
-  else if (combined_properties & VK_SAMPLE_COUNT_4_BIT)
-    m_max_multisamples = 4;
-  else if (combined_properties & VK_SAMPLE_COUNT_2_BIT)
-    m_max_multisamples = 2;
-  else
-    m_max_multisamples = 1;
+void VulkanDevice::SetFeatures(CreateFlags create_flags, VkPhysicalDevice physical_device,
+                               const VkPhysicalDeviceFeatures& vk_features)
+{
+  const u32 store_api_version = std::min(m_device_properties.apiVersion, VK_API_VERSION_1_1);
+  m_render_api_version = (VK_API_VERSION_MAJOR(store_api_version) * 100u) +
+                         (VK_API_VERSION_MINOR(store_api_version) * 10u) + (VK_API_VERSION_PATCH(store_api_version));
+  m_max_texture_size =
+    std::min(m_device_properties.limits.maxImageDimension2D, m_device_properties.limits.maxFramebufferWidth);
+  m_max_multisamples = static_cast<u16>(Vulkan::GetMaxMultisamples(physical_device, m_device_properties));
 
   m_features.dual_source_blend =
-    !(disabled_features & FEATURE_MASK_DUAL_SOURCE_BLEND) && m_device_features.dualSrcBlend;
-  m_features.framebuffer_fetch = /*!(disabled_features & FEATURE_MASK_FRAMEBUFFER_FETCH) && */false;
+    !HasCreateFlag(create_flags, CreateFlags::DisableDualSourceBlend) && vk_features.dualSrcBlend;
+  m_features.framebuffer_fetch =
+    !HasCreateFlag(create_flags, CreateFlags::DisableFeedbackLoops | CreateFlags::DisableFramebufferFetch) &&
+    m_optional_extensions.vk_ext_rasterization_order_attachment_access;
 
   if (!m_features.dual_source_blend)
-    Log_WarningPrintf("Vulkan driver is missing dual-source blending. This will have an impact on performance.");
+    WARNING_LOG("Vulkan driver is missing dual-source blending. This will have an impact on performance.");
 
   m_features.noperspective_interpolation = true;
-  m_features.texture_copy_to_self = !(disabled_features & FEATURE_MASK_TEXTURE_COPY_TO_SELF);
-  m_features.per_sample_shading = m_device_features.sampleRateShading;
-  m_features.supports_texture_buffers = !(disabled_features & FEATURE_MASK_TEXTURE_BUFFERS);
+  m_features.texture_copy_to_self = !HasCreateFlag(create_flags, CreateFlags::DisableTextureCopyToSelf);
+  m_features.per_sample_shading = vk_features.sampleRateShading;
+  m_features.texture_buffers = !HasCreateFlag(create_flags, CreateFlags::DisableTextureBuffers);
+  m_features.feedback_loops = !HasCreateFlag(create_flags, CreateFlags::DisableFeedbackLoops);
 
 #ifdef __APPLE__
   // Partial texture buffer uploads appear to be broken in macOS/MoltenVK.
   m_features.texture_buffers_emulated_with_ssbo = true;
 #else
   const u32 max_texel_buffer_elements = m_device_properties.limits.maxTexelBufferElements;
-  Log_InfoPrintf("Max texel buffer elements: %u", max_texel_buffer_elements);
+  INFO_LOG("Max texel buffer elements: {}", max_texel_buffer_elements);
   if (max_texel_buffer_elements < MIN_TEXEL_BUFFER_ELEMENTS)
   {
     m_features.texture_buffers_emulated_with_ssbo = true;
@@ -2219,16 +2023,27 @@ bool VulkanDevice::CheckFeatures(FeatureMask disabled_features)
 #endif
 
   if (m_features.texture_buffers_emulated_with_ssbo)
-    Log_WarningPrintf("Emulating texture buffers with SSBOs.");
+    WARNING_LOG("Emulating texture buffers with SSBOs.");
 
   m_features.geometry_shaders =
-    !(disabled_features & FEATURE_MASK_GEOMETRY_SHADERS) && m_device_features.geometryShader;
+    !HasCreateFlag(create_flags, CreateFlags::DisableGeometryShaders) && vk_features.geometryShader;
+  m_features.compute_shaders = !HasCreateFlag(create_flags, CreateFlags::DisableComputeShaders);
 
   m_features.partial_msaa_resolve = true;
+  m_features.memory_import = m_optional_extensions.vk_ext_external_memory_host;
+  m_features.exclusive_fullscreen = false;
+  m_features.explicit_present = true;
+  m_features.timed_present = false;
   m_features.shader_cache = true;
   m_features.pipeline_cache = true;
+  m_features.prefer_unused_textures = true;
+  m_features.raster_order_views =
+    (!HasCreateFlag(create_flags, CreateFlags::DisableRasterOrderViews) && vk_features.fragmentStoresAndAtomics &&
+     m_optional_extensions.vk_ext_fragment_shader_interlock);
 
-  return true;
+  // Same feature bit for both.
+  m_features.dxt_textures = m_features.bptc_textures =
+    (!HasCreateFlag(create_flags, CreateFlags::DisableCompressedTextures) && vk_features.textureCompressionBC);
 }
 
 void VulkanDevice::CopyTextureRegion(GPUTexture* dst, u32 dst_x, u32 dst_y, u32 dst_layer, u32 dst_level,
@@ -2296,12 +2111,16 @@ void VulkanDevice::CopyTextureRegion(GPUTexture* dst, u32 dst_x, u32 dst_y, u32 
   if (InRenderPass())
     EndRenderPass();
 
+  s_stats.num_copies++;
+
   S->SetUseFenceCounter(GetCurrentFenceCounter());
   D->SetUseFenceCounter(GetCurrentFenceCounter());
-  S->TransitionToLayout((D == S) ? VulkanTexture::Layout::TransferSelf : VulkanTexture::Layout::TransferSrc);
-  D->TransitionToLayout((D == S) ? VulkanTexture::Layout::TransferSelf : VulkanTexture::Layout::TransferDst);
+  S->TransitionToLayout(m_current_command_buffer,
+                        (D == S) ? VulkanTexture::Layout::TransferSelf : VulkanTexture::Layout::TransferSrc);
+  D->TransitionToLayout(m_current_command_buffer,
+                        (D == S) ? VulkanTexture::Layout::TransferSelf : VulkanTexture::Layout::TransferDst);
 
-  vkCmdCopyImage(GetCurrentCommandBuffer(), S->GetImage(), S->GetVkLayout(), D->GetImage(), D->GetVkLayout(), 1, &ic);
+  vkCmdCopyImage(m_current_command_buffer, S->GetImage(), S->GetVkLayout(), D->GetImage(), D->GetVkLayout(), 1, &ic);
 
   D->SetState(GPUTexture::State::Dirty);
 }
@@ -2320,22 +2139,24 @@ void VulkanDevice::ResolveTextureRegion(GPUTexture* dst, u32 dst_x, u32 dst_y, u
   if (InRenderPass())
     EndRenderPass();
 
+  s_stats.num_copies++;
+
   VulkanTexture* D = static_cast<VulkanTexture*>(dst);
   VulkanTexture* S = static_cast<VulkanTexture*>(src);
-  const VkCommandBuffer cmdbuf = GetCurrentCommandBuffer();
 
   if (S->GetState() == GPUTexture::State::Cleared)
-    S->CommitClear(cmdbuf);
+    S->CommitClear(m_current_command_buffer);
   if (D->IsRenderTargetOrDepthStencil() && D->GetState() == GPUTexture::State::Cleared)
   {
     if (width < dst->GetWidth() || height < dst->GetHeight())
-      D->CommitClear(cmdbuf);
+      D->CommitClear(m_current_command_buffer);
     else
       D->SetState(GPUTexture::State::Dirty);
   }
 
-  S->TransitionSubresourcesToLayout(cmdbuf, 0, 1, 0, 1, S->GetLayout(), VulkanTexture::Layout::TransferSrc);
-  D->TransitionSubresourcesToLayout(cmdbuf, dst_layer, 1, dst_level, 1, D->GetLayout(),
+  S->TransitionSubresourcesToLayout(m_current_command_buffer, 0, 1, 0, 1, S->GetLayout(),
+                                    VulkanTexture::Layout::TransferSrc);
+  D->TransitionSubresourcesToLayout(m_current_command_buffer, dst_layer, 1, dst_level, 1, D->GetLayout(),
                                     VulkanTexture::Layout::TransferDst);
 
   const VkImageResolve resolve = {{VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u},
@@ -2343,35 +2164,77 @@ void VulkanDevice::ResolveTextureRegion(GPUTexture* dst, u32 dst_x, u32 dst_y, u
                                   {VK_IMAGE_ASPECT_COLOR_BIT, dst_level, dst_layer, 1u},
                                   {static_cast<s32>(dst_x), static_cast<s32>(dst_y), 0},
                                   {width, height, 1}};
-  vkCmdResolveImage(cmdbuf, S->GetImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, D->GetImage(),
+  vkCmdResolveImage(m_current_command_buffer, S->GetImage(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, D->GetImage(),
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &resolve);
 
-  S->TransitionSubresourcesToLayout(cmdbuf, 0, 1, 0, 1, VulkanTexture::Layout::TransferSrc, S->GetLayout());
-  D->TransitionSubresourcesToLayout(cmdbuf, dst_layer, 1, dst_level, 1, VulkanTexture::Layout::TransferDst,
-                                    D->GetLayout());
+  S->TransitionSubresourcesToLayout(m_current_command_buffer, 0, 1, 0, 1, VulkanTexture::Layout::TransferSrc,
+                                    S->GetLayout());
+  D->TransitionSubresourcesToLayout(m_current_command_buffer, dst_layer, 1, dst_level, 1,
+                                    VulkanTexture::Layout::TransferDst, D->GetLayout());
 }
 
 void VulkanDevice::ClearRenderTarget(GPUTexture* t, u32 c)
 {
   GPUDevice::ClearRenderTarget(t, c);
-  if (InRenderPass() && m_current_framebuffer && m_current_framebuffer->GetRT() == t)
-    EndRenderPass();
+  if (InRenderPass())
+  {
+    const s32 idx = IsRenderTargetBoundIndex(t);
+    if (idx >= 0)
+    {
+      VulkanTexture* T = static_cast<VulkanTexture*>(t);
+
+      if (m_driver_type == GPUDriverType::NVIDIAProprietary)
+      {
+        EndRenderPass();
+      }
+      else
+      {
+        // Use an attachment clear so the render pass isn't restarted.
+        const VkClearAttachment ca = {VK_IMAGE_ASPECT_COLOR_BIT,
+                                      static_cast<u32>(idx),
+                                      {.color = static_cast<VulkanTexture*>(T)->GetClearColorValue()}};
+        const VkClearRect rc = {{{0, 0}, {T->GetWidth(), T->GetHeight()}}, 0u, 1u};
+        vkCmdClearAttachments(m_current_command_buffer, 1, &ca, 1, &rc);
+        T->SetState(GPUTexture::State::Dirty);
+      }
+    }
+  }
 }
 
 void VulkanDevice::ClearDepth(GPUTexture* t, float d)
 {
   GPUDevice::ClearDepth(t, d);
-  if (InRenderPass() && m_current_framebuffer && m_current_framebuffer->GetDS() == t)
-    EndRenderPass();
+  if (InRenderPass() && m_current_depth_target == t)
+  {
+    // Using vkCmdClearAttachments() within a render pass on NVIDIA seems to cause dependency issues
+    // between draws that are testing depth which precede it. The result is flickering where Z tests
+    // should be failing. Breaking/restarting the render pass isn't enough to work around the bug,
+    // it needs an explicit pipeline barrier.
+    VulkanTexture* T = static_cast<VulkanTexture*>(t);
+    if (m_driver_type == GPUDriverType::NVIDIAProprietary)
+    {
+      EndRenderPass();
+      T->TransitionSubresourcesToLayout(m_current_command_buffer, 0, 1, 0, 1, T->GetLayout(), T->GetLayout());
+    }
+    else
+    {
+      // Use an attachment clear so the render pass isn't restarted.
+      const VkClearAttachment ca = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, {.depthStencil = T->GetClearDepthValue()}};
+      const VkClearRect rc = {{{0, 0}, {T->GetWidth(), T->GetHeight()}}, 0u, 1u};
+      vkCmdClearAttachments(m_current_command_buffer, 1, &ca, 1, &rc);
+      T->SetState(GPUTexture::State::Dirty);
+    }
+  }
 }
 
 void VulkanDevice::InvalidateRenderTarget(GPUTexture* t)
 {
   GPUDevice::InvalidateRenderTarget(t);
-  if (InRenderPass() && m_current_framebuffer &&
-      (m_current_framebuffer->GetRT() == t || m_current_framebuffer->GetDS() == t))
+  if (InRenderPass() && (t->IsDepthStencil() ? (m_current_depth_target == t) : (IsRenderTargetBoundIndex(t) >= 0)))
   {
-    EndRenderPass();
+    // Invalidate includes leaving whatever's in the current buffer.
+    GL_INS_FMT("Invalidating current {}", t->IsDepthStencil() ? "DS" : "RT");
+    t->SetState(GPUTexture::State::Dirty);
   }
 }
 
@@ -2379,25 +2242,25 @@ bool VulkanDevice::CreateBuffers()
 {
   if (!m_vertex_buffer.Create(VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VERTEX_BUFFER_SIZE))
   {
-    Log_ErrorPrint("Failed to allocate vertex buffer");
+    ERROR_LOG("Failed to allocate vertex buffer");
     return false;
   }
 
   if (!m_index_buffer.Create(VK_BUFFER_USAGE_INDEX_BUFFER_BIT, INDEX_BUFFER_SIZE))
   {
-    Log_ErrorPrint("Failed to allocate index buffer");
+    ERROR_LOG("Failed to allocate index buffer");
     return false;
   }
 
   if (!m_uniform_buffer.Create(VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VERTEX_UNIFORM_BUFFER_SIZE))
   {
-    Log_ErrorPrint("Failed to allocate uniform buffer");
+    ERROR_LOG("Failed to allocate uniform buffer");
     return false;
   }
 
   if (!m_texture_upload_buffer.Create(VK_BUFFER_USAGE_TRANSFER_SRC_BIT, TEXTURE_BUFFER_SIZE))
   {
-    Log_ErrorPrint("Failed to allocate texture upload buffer");
+    ERROR_LOG("Failed to allocate texture upload buffer");
     return false;
   }
 
@@ -2430,7 +2293,9 @@ void VulkanDevice::MapVertexBuffer(u32 vertex_size, u32 vertex_count, void** map
 
 void VulkanDevice::UnmapVertexBuffer(u32 vertex_size, u32 vertex_count)
 {
-  m_vertex_buffer.CommitMemory(vertex_size * vertex_count);
+  const u32 size = vertex_size * vertex_count;
+  s_stats.buffer_streamed += size;
+  m_vertex_buffer.CommitMemory(size);
 }
 
 void VulkanDevice::MapIndexBuffer(u32 index_count, DrawIndex** map_ptr, u32* map_space, u32* map_base_index)
@@ -2450,24 +2315,28 @@ void VulkanDevice::MapIndexBuffer(u32 index_count, DrawIndex** map_ptr, u32* map
 
 void VulkanDevice::UnmapIndexBuffer(u32 used_index_count)
 {
-  m_index_buffer.CommitMemory(sizeof(DrawIndex) * used_index_count);
+  const u32 size = sizeof(DrawIndex) * used_index_count;
+  s_stats.buffer_streamed += size;
+  m_index_buffer.CommitMemory(size);
 }
 
-void VulkanDevice::PushUniformBuffer(const void* data, u32 data_size)
+void VulkanDevice::PushUniformBuffer(bool is_compute, const void* data, u32 data_size)
 {
-  DebugAssert(data_size < UNIFORM_PUSH_CONSTANTS_SIZE);
-  vkCmdPushConstants(GetCurrentCommandBuffer(), GetCurrentVkPipelineLayout(), UNIFORM_PUSH_CONSTANTS_STAGES, 0,
-                     data_size, data);
+  DebugAssert(data_size <= UNIFORM_PUSH_CONSTANTS_SIZE);
+  s_stats.buffer_streamed += data_size;
+  vkCmdPushConstants(m_current_command_buffer, GetCurrentVkPipelineLayout(is_compute),
+                     is_compute ? VK_SHADER_STAGE_COMPUTE_BIT :
+                                  static_cast<VkShaderStageFlagBits>(UNIFORM_PUSH_CONSTANTS_STAGES),
+                     0, data_size, data);
 }
 
 void* VulkanDevice::MapUniformBuffer(u32 size)
 {
-  const u32 align = static_cast<u32>(m_device_properties.limits.minUniformBufferOffsetAlignment);
-  const u32 used_space = Common::AlignUpPow2(size, align);
-  if (!m_uniform_buffer.ReserveMemory(used_space + MAX_UNIFORM_BUFFER_SIZE, align))
+  const u32 used_space = Common::AlignUpPow2(size, m_uniform_buffer_alignment);
+  if (!m_uniform_buffer.ReserveMemory(used_space + MAX_UNIFORM_BUFFER_SIZE, m_uniform_buffer_alignment))
   {
     SubmitCommandBufferAndRestartRenderPass("out of uniform space");
-    if (!m_uniform_buffer.ReserveMemory(used_space + MAX_UNIFORM_BUFFER_SIZE, align))
+    if (!m_uniform_buffer.ReserveMemory(used_space + MAX_UNIFORM_BUFFER_SIZE, m_uniform_buffer_alignment))
       Panic("Failed to allocate uniform space.");
   }
 
@@ -2476,37 +2345,43 @@ void* VulkanDevice::MapUniformBuffer(u32 size)
 
 void VulkanDevice::UnmapUniformBuffer(u32 size)
 {
+  s_stats.buffer_streamed += size;
   m_uniform_buffer_position = m_uniform_buffer.GetCurrentOffset();
   m_uniform_buffer.CommitMemory(size);
   m_dirty_flags |= DIRTY_FLAG_DYNAMIC_OFFSETS;
 }
 
-bool VulkanDevice::CreateNullTexture()
+bool VulkanDevice::CreateNullTexture(Error* error)
 {
-  m_null_texture = VulkanTexture::Create(1, 1, 1, 1, 1, GPUTexture::Type::RenderTarget, GPUTexture::Format::RGBA8,
-                                         VK_FORMAT_R8G8B8A8_UNORM);
-  if (!m_null_texture)
+  std::unique_ptr<VulkanTexture> null_texture =
+    VulkanTexture::Create(1, 1, 1, 1, 1, GPUTexture::Type::Texture, GPUTextureFormat::RGBA8,
+                          GPUTexture::Flags::AllowBindAsImage, VK_FORMAT_R8G8B8A8_UNORM, error);
+  if (!null_texture)
+  {
+    Error::AddPrefix(error, "Failed to create null texture: ");
     return false;
+  }
 
-  const VkCommandBuffer cmdbuf = GetCurrentCommandBuffer();
+  const VkCommandBuffer cmdbuf = GetCurrentInitCommandBuffer();
   const VkImageSubresourceRange srr{VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
   const VkClearColorValue ccv{};
-  m_null_texture->TransitionToLayout(cmdbuf, VulkanTexture::Layout::ClearDst);
-  vkCmdClearColorImage(cmdbuf, m_null_texture->GetImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &ccv, 1, &srr);
-  m_null_texture->TransitionToLayout(cmdbuf, VulkanTexture::Layout::General);
-  Vulkan::SetObjectName(m_device, m_null_texture->GetImage(), "Null texture");
-  Vulkan::SetObjectName(m_device, m_null_texture->GetView(), "Null texture view");
+  null_texture->TransitionToLayout(cmdbuf, VulkanTexture::Layout::ClearDst);
+  vkCmdClearColorImage(cmdbuf, null_texture->GetImage(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &ccv, 1, &srr);
+  null_texture->TransitionToLayout(cmdbuf, VulkanTexture::Layout::General);
+  Vulkan::SetObjectName(m_device, null_texture->GetImage(), "Null texture");
+  Vulkan::SetObjectName(m_device, null_texture->GetView(), "Null texture view");
+  m_empty_texture = std::move(null_texture);
 
   // Bind null texture and point sampler state to all.
-  const VkSampler point_sampler = GetSampler(GPUSampler::GetNearestConfig());
-  if (point_sampler == VK_NULL_HANDLE)
+  GPUSampler* point_sampler = GetSampler(GPUSampler::GetNearestConfig(), error);
+  if (!point_sampler)
+  {
+    Error::AddPrefix(error, "Failed to get nearest sampler for init bind: ");
     return false;
+  }
 
   for (u32 i = 0; i < MAX_TEXTURE_SAMPLERS; i++)
-  {
-    m_current_textures[i] = m_null_texture.get();
-    m_current_samplers[i] = point_sampler;
-  }
+    m_current_samplers[i] = static_cast<VulkanSampler*>(point_sampler)->GetSampler();
 
   return true;
 }
@@ -2525,7 +2400,8 @@ bool VulkanDevice::CreatePipelineLayouts()
   }
 
   {
-    dslb.AddBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
+    dslb.AddBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                    VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
     if ((m_single_texture_ds_layout = dslb.Create(m_device)) == VK_NULL_HANDLE)
       return false;
     Vulkan::SetObjectName(m_device, m_single_texture_ds_layout, "Single Texture Descriptor Set Layout");
@@ -2545,56 +2421,140 @@ bool VulkanDevice::CreatePipelineLayouts()
     if (m_optional_extensions.vk_khr_push_descriptor)
       dslb.SetPushFlag();
     for (u32 i = 0; i < MAX_TEXTURE_SAMPLERS; i++)
-      dslb.AddBinding(i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
+      dslb.AddBinding(i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+                      VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
     if ((m_multi_texture_ds_layout = dslb.Create(m_device)) == VK_NULL_HANDLE)
       return false;
     Vulkan::SetObjectName(m_device, m_multi_texture_ds_layout, "Multi Texture Descriptor Set Layout");
   }
 
+  if (m_features.feedback_loops)
   {
-    VkPipelineLayout& pl = m_pipeline_layouts[static_cast<u8>(GPUPipeline::Layout::SingleTextureAndUBO)];
-    plb.AddDescriptorSet(m_ubo_ds_layout);
-    plb.AddDescriptorSet(m_single_texture_ds_layout);
-    if ((pl = plb.Create(m_device)) == VK_NULL_HANDLE)
+    // TODO: This isn't ideal, since we can't push the RT descriptors.
+    dslb.AddBinding(0, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT);
+    if ((m_feedback_loop_ds_layout = dslb.Create(m_device)) == VK_NULL_HANDLE)
       return false;
-    Vulkan::SetObjectName(m_device, pl, "Single Texture + UBO Pipeline Layout");
+    Vulkan::SetObjectName(m_device, m_feedback_loop_ds_layout, "Feedback Loop Descriptor Set Layout");
+  }
+
+  for (u32 i = 0; i < MAX_IMAGE_RENDER_TARGETS; i++)
+  {
+    dslb.AddBinding(i, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT);
+  }
+  if ((m_image_ds_layout = dslb.Create(m_device)) == VK_NULL_HANDLE)
+    return false;
+  Vulkan::SetObjectName(m_device, m_image_ds_layout, "ROV Descriptor Set Layout");
+
+  for (u32 type = 0; type < 3; type++)
+  {
+    const bool feedback_loop = (type == 1);
+    const bool rov = (type == 2);
+    if ((feedback_loop && !m_features.feedback_loops) || (rov && !m_features.raster_order_views))
+      continue;
+
+    {
+      VkPipelineLayout& pl = m_pipeline_layouts[type][static_cast<u8>(GPUPipeline::Layout::SingleTextureAndUBO)];
+      plb.AddDescriptorSet(m_ubo_ds_layout);
+      plb.AddDescriptorSet(m_single_texture_ds_layout);
+      if (feedback_loop)
+        plb.AddDescriptorSet(m_feedback_loop_ds_layout);
+      else if (rov)
+        plb.AddDescriptorSet(m_image_ds_layout);
+      if ((pl = plb.Create(m_device)) == VK_NULL_HANDLE)
+        return false;
+      Vulkan::SetObjectName(m_device, pl, "Single Texture + UBO Pipeline Layout");
+    }
+
+    {
+      VkPipelineLayout& pl =
+        m_pipeline_layouts[type][static_cast<u8>(GPUPipeline::Layout::SingleTextureAndPushConstants)];
+      plb.AddDescriptorSet(m_single_texture_ds_layout);
+      if (feedback_loop)
+        plb.AddDescriptorSet(m_feedback_loop_ds_layout);
+      else if (rov)
+        plb.AddDescriptorSet(m_image_ds_layout);
+      plb.AddPushConstants(UNIFORM_PUSH_CONSTANTS_STAGES, 0, UNIFORM_PUSH_CONSTANTS_SIZE);
+      if ((pl = plb.Create(m_device)) == VK_NULL_HANDLE)
+        return false;
+      Vulkan::SetObjectName(m_device, pl, "Single Texture Pipeline Layout");
+    }
+
+    {
+      VkPipelineLayout& pl =
+        m_pipeline_layouts[type][static_cast<u8>(GPUPipeline::Layout::SingleTextureBufferAndPushConstants)];
+      plb.AddDescriptorSet(m_single_texture_buffer_ds_layout);
+      if (feedback_loop)
+        plb.AddDescriptorSet(m_feedback_loop_ds_layout);
+      else if (rov)
+        plb.AddDescriptorSet(m_image_ds_layout);
+      plb.AddPushConstants(UNIFORM_PUSH_CONSTANTS_STAGES, 0, UNIFORM_PUSH_CONSTANTS_SIZE);
+      if ((pl = plb.Create(m_device)) == VK_NULL_HANDLE)
+        return false;
+      Vulkan::SetObjectName(m_device, pl, "Single Texture Buffer + UBO Pipeline Layout");
+    }
+
+    {
+      VkPipelineLayout& pl = m_pipeline_layouts[type][static_cast<u8>(GPUPipeline::Layout::MultiTextureAndUBO)];
+      plb.AddDescriptorSet(m_ubo_ds_layout);
+      plb.AddDescriptorSet(m_multi_texture_ds_layout);
+      if (feedback_loop)
+        plb.AddDescriptorSet(m_feedback_loop_ds_layout);
+      else if (rov)
+        plb.AddDescriptorSet(m_image_ds_layout);
+      if ((pl = plb.Create(m_device)) == VK_NULL_HANDLE)
+        return false;
+      Vulkan::SetObjectName(m_device, pl, "Multi Texture + UBO + Push Constant Pipeline Layout");
+    }
+
+    {
+      VkPipelineLayout& pl =
+        m_pipeline_layouts[type][static_cast<u8>(GPUPipeline::Layout::MultiTextureAndPushConstants)];
+      plb.AddDescriptorSet(m_multi_texture_ds_layout);
+      plb.AddPushConstants(UNIFORM_PUSH_CONSTANTS_STAGES, 0, UNIFORM_PUSH_CONSTANTS_SIZE);
+      if (feedback_loop)
+        plb.AddDescriptorSet(m_feedback_loop_ds_layout);
+      else if (rov)
+        plb.AddDescriptorSet(m_image_ds_layout);
+      if ((pl = plb.Create(m_device)) == VK_NULL_HANDLE)
+        return false;
+      Vulkan::SetObjectName(m_device, pl, "Multi Texture Pipeline Layout");
+    }
+
+    {
+      VkPipelineLayout& pl =
+        m_pipeline_layouts[type][static_cast<u8>(GPUPipeline::Layout::MultiTextureAndUBOAndPushConstants)];
+      plb.AddDescriptorSet(m_ubo_ds_layout);
+      plb.AddDescriptorSet(m_multi_texture_ds_layout);
+      plb.AddPushConstants(UNIFORM_PUSH_CONSTANTS_STAGES, 0, UNIFORM_PUSH_CONSTANTS_SIZE);
+      if (feedback_loop)
+        plb.AddDescriptorSet(m_feedback_loop_ds_layout);
+      else if (rov)
+        plb.AddDescriptorSet(m_image_ds_layout);
+      if ((pl = plb.Create(m_device)) == VK_NULL_HANDLE)
+        return false;
+      Vulkan::SetObjectName(m_device, pl, "Multi Texture + UBO + Push Constant Pipeline Layout");
+    }
   }
 
   {
-    VkPipelineLayout& pl = m_pipeline_layouts[static_cast<u8>(GPUPipeline::Layout::SingleTextureAndPushConstants)];
-    plb.AddDescriptorSet(m_single_texture_ds_layout);
-    plb.AddPushConstants(UNIFORM_PUSH_CONSTANTS_STAGES, 0, UNIFORM_PUSH_CONSTANTS_SIZE);
+    VkPipelineLayout& pl = m_pipeline_layouts[0][static_cast<u8>(GPUPipeline::Layout::ComputeMultiTextureAndUBO)];
+    plb.AddDescriptorSet(m_ubo_ds_layout);
+    plb.AddDescriptorSet(m_multi_texture_ds_layout);
+    plb.AddDescriptorSet(m_image_ds_layout);
     if ((pl = plb.Create(m_device)) == VK_NULL_HANDLE)
       return false;
-    Vulkan::SetObjectName(m_device, pl, "Single Texture Pipeline Layout");
+    Vulkan::SetObjectName(m_device, pl, "Compute Multi Texture + UBO Pipeline Layout");
   }
 
   {
     VkPipelineLayout& pl =
-      m_pipeline_layouts[static_cast<u8>(GPUPipeline::Layout::SingleTextureBufferAndPushConstants)];
-    plb.AddDescriptorSet(m_single_texture_buffer_ds_layout);
-    plb.AddPushConstants(UNIFORM_PUSH_CONSTANTS_STAGES, 0, UNIFORM_PUSH_CONSTANTS_SIZE);
-    if ((pl = plb.Create(m_device)) == VK_NULL_HANDLE)
-      return false;
-    Vulkan::SetObjectName(m_device, pl, "Single Texture Buffer + UBO Pipeline Layout");
-  }
-
-  {
-    VkPipelineLayout& pl = m_pipeline_layouts[static_cast<u8>(GPUPipeline::Layout::MultiTextureAndUBO)];
-    plb.AddDescriptorSet(m_ubo_ds_layout);
+      m_pipeline_layouts[0][static_cast<u8>(GPUPipeline::Layout::ComputeMultiTextureAndPushConstants)];
     plb.AddDescriptorSet(m_multi_texture_ds_layout);
+    plb.AddDescriptorSet(m_image_ds_layout);
+    plb.AddPushConstants(VK_SHADER_STAGE_COMPUTE_BIT, 0, UNIFORM_PUSH_CONSTANTS_SIZE);
     if ((pl = plb.Create(m_device)) == VK_NULL_HANDLE)
       return false;
-    Vulkan::SetObjectName(m_device, pl, "Multi Texture + UBO Pipeline Layout");
-  }
-
-  {
-    VkPipelineLayout& pl = m_pipeline_layouts[static_cast<u8>(GPUPipeline::Layout::MultiTextureAndPushConstants)];
-    plb.AddDescriptorSet(m_multi_texture_ds_layout);
-    plb.AddPushConstants(UNIFORM_PUSH_CONSTANTS_STAGES, 0, UNIFORM_PUSH_CONSTANTS_SIZE);
-    if ((pl = plb.Create(m_device)) == VK_NULL_HANDLE)
-      return false;
-    Vulkan::SetObjectName(m_device, pl, "Multi Texture Pipeline Layout");
+    Vulkan::SetObjectName(m_device, pl, "Compute Multi Texture Pipeline Layout");
   }
 
   return true;
@@ -2602,14 +2562,13 @@ bool VulkanDevice::CreatePipelineLayouts()
 
 void VulkanDevice::DestroyPipelineLayouts()
 {
-  for (VkPipelineLayout& pl : m_pipeline_layouts)
-  {
+  m_pipeline_layouts.enumerate([this](auto& pl) {
     if (pl != VK_NULL_HANDLE)
     {
       vkDestroyPipelineLayout(m_device, pl, nullptr);
       pl = VK_NULL_HANDLE;
     }
-  }
+  });
 
   auto destroy_dsl = [this](VkDescriptorSetLayout& l) {
     if (l != VK_NULL_HANDLE)
@@ -2618,6 +2577,8 @@ void VulkanDevice::DestroyPipelineLayouts()
       l = VK_NULL_HANDLE;
     }
   };
+  destroy_dsl(m_image_ds_layout);
+  destroy_dsl(m_feedback_loop_ds_layout);
   destroy_dsl(m_multi_texture_ds_layout);
   destroy_dsl(m_single_texture_buffer_ds_layout);
   destroy_dsl(m_single_texture_ds_layout);
@@ -2645,209 +2606,460 @@ void VulkanDevice::DestroyPersistentDescriptorSets()
     FreePersistentDescriptorSet(m_ubo_descriptor_set);
 }
 
-void VulkanDevice::RenderBlankFrame()
+void VulkanDevice::RenderBlankFrame(VulkanSwapChain* swap_chain)
 {
-  VkResult res = m_swap_chain->AcquireNextImage();
+  VkResult res = swap_chain->AcquireNextImage(true);
   if (res != VK_SUCCESS)
   {
-    Log_ErrorPrintf("Failed to acquire image for blank frame present");
+    ERROR_LOG("Failed to acquire image for blank frame present");
     return;
   }
 
-  VkCommandBuffer cmdbuf = GetCurrentCommandBuffer();
-
-  const VkImage image = m_swap_chain->GetCurrentImage();
+  const VkImage image = swap_chain->GetCurrentImage();
   static constexpr VkImageSubresourceRange srr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-  VulkanTexture::TransitionSubresourcesToLayout(cmdbuf, image, GPUTexture::Type::RenderTarget, 0, 1, 0, 1,
-                                                VulkanTexture::Layout::Undefined, VulkanTexture::Layout::TransferDst);
-  vkCmdClearColorImage(cmdbuf, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &s_present_clear_color.color, 1, &srr);
-  VulkanTexture::TransitionSubresourcesToLayout(cmdbuf, image, GPUTexture::Type::RenderTarget, 0, 1, 0, 1,
-                                                VulkanTexture::Layout::TransferDst, VulkanTexture::Layout::PresentSrc);
+  static constexpr VkClearColorValue clear_color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+  VulkanTexture::TransitionSubresourcesToLayout(m_current_command_buffer, image, GPUTexture::Type::RenderTarget, 0, 1,
+                                                0, 1, VulkanTexture::Layout::Undefined,
+                                                VulkanTexture::Layout::TransferDst);
+  vkCmdClearColorImage(m_current_command_buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear_color, 1, &srr);
+  VulkanTexture::TransitionSubresourcesToLayout(m_current_command_buffer, image, GPUTexture::Type::RenderTarget, 0, 1,
+                                                0, 1, VulkanTexture::Layout::TransferDst,
+                                                VulkanTexture::Layout::PresentSrc);
 
-  SubmitCommandBuffer(m_swap_chain.get(), !m_swap_chain->IsPresentModeSynchronizing());
-  MoveToNextCommandBuffer();
+  EndAndSubmitCommandBuffer(false, swap_chain, false);
 
   InvalidateCachedState();
 }
 
-void VulkanDevice::SetFramebuffer(GPUFramebuffer* fb)
+bool VulkanDevice::TryImportHostMemory(void* data, size_t data_size, VkBufferUsageFlags buffer_usage,
+                                       VkDeviceMemory* out_memory, VkBuffer* out_buffer, VkDeviceSize* out_offset,
+                                       Error* error)
 {
-  if (m_current_framebuffer == fb)
-    return;
+  if (!m_optional_extensions.vk_ext_external_memory_host)
+  {
+    Error::SetStringView(error, "VK_EXT_external_memory_host is not supported.");
+    return false;
+  }
 
-  if (InRenderPass())
-    EndRenderPass();
+  // Align to the nearest page
+  void* data_aligned =
+    reinterpret_cast<void*>(Common::AlignDownPow2(reinterpret_cast<uintptr_t>(data), HOST_PAGE_SIZE));
 
-  m_current_framebuffer = static_cast<VulkanFramebuffer*>(fb);
+  // Offset to the start of the data within the page
+  const size_t data_offset = reinterpret_cast<uintptr_t>(data) & static_cast<uintptr_t>(HOST_PAGE_MASK);
+
+  // Full amount of data that must be imported, including the pages
+  const size_t data_size_aligned = Common::AlignUpPow2(data_offset + data_size, HOST_PAGE_SIZE);
+
+  VkMemoryHostPointerPropertiesEXT pointer_properties = {VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT, nullptr,
+                                                         0};
+  VkResult res = vkGetMemoryHostPointerPropertiesEXT(m_device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                                     data_aligned, &pointer_properties);
+  if (res != VK_SUCCESS || pointer_properties.memoryTypeBits == 0)
+  {
+    Vulkan::SetErrorObject(error, "vkGetMemoryHostPointerPropertiesEXT() failed: ", res);
+    return false;
+  }
+
+  VmaAllocationCreateInfo vma_alloc_info = {};
+  vma_alloc_info.preferredFlags =
+    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+  vma_alloc_info.memoryTypeBits = pointer_properties.memoryTypeBits;
+
+  u32 memory_index = 0;
+  res = vmaFindMemoryTypeIndex(m_allocator, pointer_properties.memoryTypeBits, &vma_alloc_info, &memory_index);
+  if (res != VK_SUCCESS)
+  {
+    Vulkan::SetErrorObject(error, "vmaFindMemoryTypeIndex() failed: ", res);
+    return false;
+  }
+
+  const VkImportMemoryHostPointerInfoEXT import_info = {VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr,
+                                                        VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+                                                        const_cast<void*>(data_aligned)};
+
+  const VkMemoryAllocateInfo alloc_info = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &import_info, data_size_aligned,
+                                           memory_index};
+
+  VkDeviceMemory imported_memory = VK_NULL_HANDLE;
+
+  res = vkAllocateMemory(m_device, &alloc_info, nullptr, &imported_memory);
+  if (res != VK_SUCCESS)
+  {
+    Vulkan::SetErrorObject(error, "vkAllocateMemory() failed: ", res);
+    return false;
+  }
+
+  const VkExternalMemoryBufferCreateInfo external_info = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, nullptr,
+                                                          VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
+
+  const VkBufferCreateInfo buffer_info = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                          &external_info,
+                                          0,
+                                          data_size_aligned,
+                                          buffer_usage,
+                                          VK_SHARING_MODE_EXCLUSIVE,
+                                          0,
+                                          nullptr};
+
+  VkBuffer imported_buffer = VK_NULL_HANDLE;
+  res = vkCreateBuffer(m_device, &buffer_info, nullptr, &imported_buffer);
+  if (res != VK_SUCCESS)
+  {
+    Vulkan::SetErrorObject(error, "vkCreateBuffer() failed: ", res);
+    if (imported_memory != VK_NULL_HANDLE)
+      vkFreeMemory(m_device, imported_memory, nullptr);
+
+    return false;
+  }
+
+  vkBindBufferMemory(m_device, imported_buffer, imported_memory, 0);
+
+  *out_memory = imported_memory;
+  *out_buffer = imported_buffer;
+  *out_offset = data_offset;
+  DEV_LOG("Imported {} byte buffer covering {} bytes at {}", data_size, data_size_aligned, data);
+  return true;
+}
+
+void VulkanDevice::SetRenderTargets(GPUTexture* const* rts, u32 num_rts, GPUTexture* ds,
+                                    GPUPipeline::RenderPassFlag flags)
+{
+  const bool changed_layout =
+    (m_current_render_pass_flags & (GPUPipeline::ColorFeedbackLoop | GPUPipeline::BindRenderTargetsAsImages)) !=
+    (flags & (GPUPipeline::ColorFeedbackLoop | GPUPipeline::BindRenderTargetsAsImages));
+  bool changed =
+    (m_num_current_render_targets != num_rts || m_current_depth_target != ds || m_current_render_pass_flags != flags);
+  bool needs_ds_clear = (ds && ds->IsClearedOrInvalidated());
+  bool needs_rt_clear = false;
+
+  m_current_depth_target = static_cast<VulkanTexture*>(ds);
+  for (u32 i = 0; i < num_rts; i++)
+  {
+    VulkanTexture* const RT = static_cast<VulkanTexture*>(rts[i]);
+    changed |= m_current_render_targets[i] != RT;
+    m_current_render_targets[i] = RT;
+    needs_rt_clear |= RT->IsClearedOrInvalidated();
+  }
+  for (u32 i = num_rts; i < m_num_current_render_targets; i++)
+    m_current_render_targets[i] = nullptr;
+  m_num_current_render_targets = Truncate8(num_rts);
+  m_current_render_pass_flags = flags;
+
+  if (changed)
+  {
+    if (InRenderPass())
+      EndRenderPass();
+
+    m_current_framebuffer = VK_NULL_HANDLE;
+    if (m_num_current_render_targets == 0 && !m_current_depth_target)
+      return;
+
+    if (!(flags & GPUPipeline::BindRenderTargetsAsImages) &&
+        (!m_optional_extensions.vk_khr_dynamic_rendering ||
+         ((flags & GPUPipeline::ColorFeedbackLoop) && !m_optional_extensions.vk_khr_dynamic_rendering_local_read)))
+    {
+      m_current_framebuffer = m_framebuffer_manager.Lookup(
+        (m_num_current_render_targets > 0) ? reinterpret_cast<GPUTexture**>(m_current_render_targets.data()) : nullptr,
+        m_num_current_render_targets, m_current_depth_target, flags);
+      if (m_current_framebuffer == VK_NULL_HANDLE)
+      {
+        ERROR_LOG("Failed to create framebuffer");
+        return;
+      }
+    }
+
+    m_dirty_flags = (m_dirty_flags & ~DIRTY_FLAG_INPUT_ATTACHMENT) | (changed_layout ? DIRTY_FLAG_PIPELINE_LAYOUT : 0) |
+                    ((flags & (GPUPipeline::ColorFeedbackLoop | GPUPipeline::BindRenderTargetsAsImages)) ?
+                       DIRTY_FLAG_INPUT_ATTACHMENT :
+                       0);
+  }
+  else if (needs_rt_clear || needs_ds_clear)
+  {
+    // TODO: This could use vkCmdClearAttachments() instead.
+    if (InRenderPass())
+      EndRenderPass();
+  }
 }
 
 void VulkanDevice::BeginRenderPass()
 {
   DebugAssert(!InRenderPass());
 
-  VkRenderPassBeginInfo bi = {
-    VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE, {}, 0u, nullptr};
-  std::array<VkClearValue, 2> clear_values;
-
-  if (m_current_framebuffer) [[likely]]
-  {
-    VkFormat rt_format = VK_FORMAT_UNDEFINED;
-    VkFormat ds_format = VK_FORMAT_UNDEFINED;
-    VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
-    VkAttachmentLoadOp rt_load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    VkAttachmentStoreOp rt_store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    VkAttachmentLoadOp ds_load_op = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    VkAttachmentStoreOp ds_store_op = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-
-    VulkanTexture* rt = static_cast<VulkanTexture*>(m_current_framebuffer->GetRT());
-    if (rt)
-    {
-      samples = static_cast<VkSampleCountFlagBits>(rt->GetSamples());
-      rt_format = rt->GetVkFormat();
-      rt_store_op = VK_ATTACHMENT_STORE_OP_STORE;
-
-      switch (rt->GetState())
-      {
-        case GPUTexture::State::Cleared:
-        {
-          std::memcpy(clear_values[0].color.float32, rt->GetUNormClearColor().data(),
-                      sizeof(clear_values[0].color.float32));
-          rt_load_op = VK_ATTACHMENT_LOAD_OP_CLEAR;
-          rt->SetState(GPUTexture::State::Dirty);
-          bi.pClearValues = clear_values.data();
-          bi.clearValueCount = 1;
-        }
-        break;
-
-        case GPUTexture::State::Invalidated:
-        {
-          // already DONT_CARE
-          rt->SetState(GPUTexture::State::Dirty);
-        }
-        break;
-
-        case GPUTexture::State::Dirty:
-        {
-          rt_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
-        }
-        break;
-
-        default:
-          UnreachableCode();
-          break;
-      }
-
-      rt->TransitionToLayout(VulkanTexture::Layout::ColorAttachment);
-      rt->SetUseFenceCounter(GetCurrentFenceCounter());
-    }
-
-    VulkanTexture* ds = static_cast<VulkanTexture*>(m_current_framebuffer->GetDS());
-    if (ds)
-    {
-      samples = static_cast<VkSampleCountFlagBits>(ds->GetSamples());
-      ds_format = ds->GetVkFormat();
-      ds_store_op = VK_ATTACHMENT_STORE_OP_STORE;
-
-      switch (ds->GetState())
-      {
-        case GPUTexture::State::Cleared:
-        {
-          const u32 idx = rt ? 1 : 0;
-          clear_values[idx].depthStencil = {ds->GetClearDepth(), 0u};
-          ds_load_op = VK_ATTACHMENT_LOAD_OP_CLEAR;
-          ds->SetState(GPUTexture::State::Dirty);
-          bi.pClearValues = clear_values.data();
-          bi.clearValueCount = idx + 1;
-        }
-        break;
-
-        case GPUTexture::State::Invalidated:
-        {
-          // already DONT_CARE
-          ds->SetState(GPUTexture::State::Dirty);
-        }
-        break;
-
-        case GPUTexture::State::Dirty:
-        {
-          ds_load_op = VK_ATTACHMENT_LOAD_OP_LOAD;
-        }
-        break;
-
-        default:
-          UnreachableCode();
-          break;
-      }
-
-      ds->TransitionToLayout(VulkanTexture::Layout::DepthStencilAttachment);
-      ds->SetUseFenceCounter(GetCurrentFenceCounter());
-    }
-
-    bi.framebuffer = m_current_framebuffer->GetFramebuffer();
-    bi.renderPass = m_current_render_pass =
-      GetRenderPass(rt_format, ds_format, samples, rt_load_op, rt_store_op, ds_load_op, ds_store_op);
-    bi.renderArea.extent = {m_current_framebuffer->GetWidth(), m_current_framebuffer->GetHeight()};
-  }
-  else
-  {
-    // Re-rendering to swap chain.
-    bi.framebuffer = m_swap_chain->GetCurrentFramebuffer();
-    bi.renderPass = m_current_render_pass =
-      GetRenderPass(m_swap_chain->GetImageFormat(), VK_FORMAT_UNDEFINED, VK_SAMPLE_COUNT_1_BIT,
-                    VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE);
-    bi.renderArea.extent = {m_swap_chain->GetWidth(), m_swap_chain->GetHeight()};
-  }
-
-  DebugAssert(m_current_render_pass);
-
   // All textures should be in shader read only optimal already, but just in case..
   const u32 num_textures = GetActiveTexturesForLayout(m_current_pipeline_layout);
   for (u32 i = 0; i < num_textures; i++)
-    m_current_textures[i]->TransitionToLayout(VulkanTexture::Layout::ShaderReadOnly);
+  {
+    if (m_current_textures[i])
+      m_current_textures[i]->TransitionToLayout(m_current_command_buffer, VulkanTexture::Layout::ShaderReadOnly);
+  }
 
-  // TODO: Stats
-  vkCmdBeginRenderPass(GetCurrentCommandBuffer(), &bi, VK_SUBPASS_CONTENTS_INLINE);
+  // NVIDIA drivers appear to return random garbage when sampling the RT via a feedback loop, if the load op for
+  // the render pass is CLEAR. Using vkCmdClearAttachments() doesn't work, so we have to clear the image instead.
+  if (m_current_render_pass_flags & GPUPipeline::ColorFeedbackLoop && m_driver_type == GPUDriverType::NVIDIAProprietary)
+  {
+    for (u32 i = 0; i < m_num_current_render_targets; i++)
+    {
+      if (m_current_render_targets[i]->GetState() == GPUTexture::State::Cleared)
+        m_current_render_targets[i]->CommitClear(m_current_command_buffer);
+    }
+  }
+
+  if (m_optional_extensions.vk_khr_dynamic_rendering &&
+      (m_optional_extensions.vk_khr_dynamic_rendering_local_read ||
+       !(m_current_render_pass_flags & GPUPipeline::ColorFeedbackLoop)))
+  {
+    VkRenderingInfoKHR ri = {
+      VK_STRUCTURE_TYPE_RENDERING_INFO_KHR, nullptr, 0u, {}, 1u, 0u, 0u, nullptr, nullptr, nullptr};
+
+    std::array<VkRenderingAttachmentInfoKHR, MAX_RENDER_TARGETS> attachments;
+    VkRenderingAttachmentInfoKHR depth_attachment;
+
+    if (m_num_current_render_targets > 0 || m_current_depth_target)
+    {
+      if (!(m_current_render_pass_flags & GPUPipeline::BindRenderTargetsAsImages))
+      {
+        ri.colorAttachmentCount = m_num_current_render_targets;
+        ri.pColorAttachments = (m_num_current_render_targets > 0) ? attachments.data() : nullptr;
+
+        // set up clear values and transition targets
+        for (u32 i = 0; i < m_num_current_render_targets; i++)
+        {
+          VulkanTexture* const rt = static_cast<VulkanTexture*>(m_current_render_targets[i]);
+          rt->TransitionToLayout(m_current_command_buffer,
+                                 (m_current_render_pass_flags & GPUPipeline::ColorFeedbackLoop) ?
+                                   VulkanTexture::Layout::FeedbackLoop :
+                                   VulkanTexture::Layout::ColorAttachment);
+          rt->SetUseFenceCounter(GetCurrentFenceCounter());
+
+          VkRenderingAttachmentInfo& ai = attachments[i];
+          ai.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
+          ai.pNext = nullptr;
+          ai.imageView = rt->GetView();
+          ai.imageLayout = rt->GetVkLayout();
+          ai.resolveMode = VK_RESOLVE_MODE_NONE_KHR;
+          ai.resolveImageView = VK_NULL_HANDLE;
+          ai.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+          ai.loadOp = GetLoadOpForTexture(rt);
+          ai.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+          if (rt->GetState() == GPUTexture::State::Cleared)
+          {
+            std::memcpy(ai.clearValue.color.float32, rt->GetUNormClearColor().data(),
+                        sizeof(ai.clearValue.color.float32));
+          }
+          rt->SetState(GPUTexture::State::Dirty);
+        }
+      }
+      else
+      {
+        // Binding as image, but we still need to clear it.
+        for (u32 i = 0; i < m_num_current_render_targets; i++)
+        {
+          VulkanTexture* rt = m_current_render_targets[i];
+          if (rt->GetState() == GPUTexture::State::Cleared)
+            rt->CommitClear(m_current_command_buffer);
+          rt->SetState(GPUTexture::State::Dirty);
+          rt->TransitionToLayout(m_current_command_buffer, VulkanTexture::Layout::ReadWriteImage);
+          rt->SetUseFenceCounter(GetCurrentFenceCounter());
+        }
+      }
+
+      if (VulkanTexture* const ds = m_current_depth_target)
+      {
+        ds->TransitionToLayout(m_current_command_buffer, VulkanTexture::Layout::DepthStencilAttachment);
+        ds->SetUseFenceCounter(GetCurrentFenceCounter());
+
+        depth_attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
+        depth_attachment.pNext = nullptr;
+        depth_attachment.imageView = ds->GetView();
+        depth_attachment.imageLayout = ds->GetVkLayout();
+        depth_attachment.resolveMode = VK_RESOLVE_MODE_NONE_KHR;
+        depth_attachment.resolveImageView = VK_NULL_HANDLE;
+        depth_attachment.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        depth_attachment.loadOp = GetLoadOpForTexture(ds);
+        depth_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        ri.pDepthAttachment = &depth_attachment;
+
+        if (ds->GetState() == GPUTexture::State::Cleared)
+          depth_attachment.clearValue.depthStencil = {ds->GetClearDepth(), 0u};
+
+        ds->SetState(GPUTexture::State::Dirty);
+      }
+
+      const VulkanTexture* const rt_or_ds =
+        (m_num_current_render_targets > 0) ? m_current_render_targets[0] : m_current_depth_target;
+      ri.renderArea = {{}, {rt_or_ds->GetWidth(), rt_or_ds->GetHeight()}};
+    }
+    else
+    {
+      VkRenderingAttachmentInfo& ai = attachments[0];
+      ai.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR;
+      ai.pNext = nullptr;
+      ai.imageView = m_current_swap_chain->GetCurrentImageView();
+      ai.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+      ai.resolveMode = VK_RESOLVE_MODE_NONE_KHR;
+      ai.resolveImageView = VK_NULL_HANDLE;
+      ai.resolveImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      ai.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      ai.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+      ri.colorAttachmentCount = 1;
+      ri.pColorAttachments = attachments.data();
+      ri.renderArea = {{}, {m_current_swap_chain->GetWidth(), m_current_swap_chain->GetHeight()}};
+    }
+
+    m_current_render_pass = DYNAMIC_RENDERING_RENDER_PASS;
+    vkCmdBeginRenderingKHR(m_current_command_buffer, &ri);
+  }
+  else
+  {
+    VkRenderPassBeginInfo bi = {
+      VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE, {}, 0u, nullptr};
+    std::array<VkClearValue, MAX_RENDER_TARGETS + 1> clear_values;
+
+    if (m_current_framebuffer != VK_NULL_HANDLE)
+    {
+      bi.framebuffer = m_current_framebuffer;
+      bi.renderPass = m_current_render_pass =
+        GetRenderPass(m_current_render_targets.data(), m_num_current_render_targets, m_current_depth_target,
+                      m_current_render_pass_flags);
+      if (bi.renderPass == VK_NULL_HANDLE)
+      {
+        ERROR_LOG("Failed to create render pass");
+        return;
+      }
+
+      // set up clear values and transition targets
+      for (u32 i = 0; i < m_num_current_render_targets; i++)
+      {
+        VulkanTexture* const rt = static_cast<VulkanTexture*>(m_current_render_targets[i]);
+        if (rt->GetState() == GPUTexture::State::Cleared)
+        {
+          std::memcpy(clear_values[i].color.float32, rt->GetUNormClearColor().data(),
+                      sizeof(clear_values[i].color.float32));
+          bi.pClearValues = clear_values.data();
+          bi.clearValueCount = i + 1;
+        }
+        rt->SetState(GPUTexture::State::Dirty);
+        rt->TransitionToLayout(m_current_command_buffer,
+                               (m_current_render_pass_flags & GPUPipeline::ColorFeedbackLoop) ?
+                                 VulkanTexture::Layout::FeedbackLoop :
+                                 VulkanTexture::Layout::ColorAttachment);
+        rt->SetUseFenceCounter(GetCurrentFenceCounter());
+      }
+      if (VulkanTexture* const ds = static_cast<VulkanTexture*>(m_current_depth_target))
+      {
+        if (ds->GetState() == GPUTexture::State::Cleared)
+        {
+          clear_values[m_num_current_render_targets].depthStencil = {ds->GetClearDepth(), 0u};
+          bi.pClearValues = clear_values.data();
+          bi.clearValueCount = m_num_current_render_targets + 1;
+        }
+        ds->SetState(GPUTexture::State::Dirty);
+        ds->TransitionToLayout(m_current_command_buffer, VulkanTexture::Layout::DepthStencilAttachment);
+        ds->SetUseFenceCounter(GetCurrentFenceCounter());
+      }
+
+      const VulkanTexture* const rt_or_ds = static_cast<const VulkanTexture*>(
+        (m_num_current_render_targets > 0) ? m_current_render_targets[0] : m_current_depth_target);
+      bi.renderArea.extent = {rt_or_ds->GetWidth(), rt_or_ds->GetHeight()};
+    }
+    else
+    {
+      // Re-rendering to swap chain.
+      bi.framebuffer = m_current_swap_chain->GetCurrentFramebuffer();
+      bi.renderPass = m_current_render_pass =
+        GetSwapChainRenderPass(m_current_swap_chain->GetFormat(), VK_ATTACHMENT_LOAD_OP_LOAD);
+      bi.renderArea.extent = {m_current_swap_chain->GetWidth(), m_current_swap_chain->GetHeight()};
+    }
+
+    DebugAssert(m_current_render_pass);
+    vkCmdBeginRenderPass(m_current_command_buffer, &bi, VK_SUBPASS_CONTENTS_INLINE);
+  }
+
+  s_stats.num_render_passes++;
 
   // If this is a new command buffer, bind the pipeline and such.
   if (m_dirty_flags & DIRTY_FLAG_INITIAL)
     SetInitialPipelineState();
 }
 
-void VulkanDevice::BeginSwapChainRenderPass()
+void VulkanDevice::BeginSwapChainRenderPass(VulkanSwapChain* swap_chain, u32 clear_color)
 {
   DebugAssert(!InRenderPass());
 
-  const VkCommandBuffer cmdbuf = GetCurrentCommandBuffer();
-  const VkImage swap_chain_image = m_swap_chain->GetCurrentImage();
+  const VkImage swap_chain_image = swap_chain->GetCurrentImage();
 
   // Swap chain images start in undefined
-  VulkanTexture::TransitionSubresourcesToLayout(cmdbuf, swap_chain_image, GPUTexture::Type::RenderTarget, 0, 1, 0, 1,
-                                                VulkanTexture::Layout::Undefined,
-                                                VulkanTexture::Layout::ColorAttachment);
+  VulkanTexture::TransitionSubresourcesToLayout(
+    m_current_command_buffer, swap_chain_image, GPUTexture::Type::RenderTarget, 0, 1, 0, 1,
+    VulkanTexture::Layout::Undefined, VulkanTexture::Layout::ColorAttachment);
 
   // All textures should be in shader read only optimal already, but just in case..
   const u32 num_textures = GetActiveTexturesForLayout(m_current_pipeline_layout);
   for (u32 i = 0; i < num_textures; i++)
-    m_current_textures[i]->TransitionToLayout(VulkanTexture::Layout::ShaderReadOnly);
+  {
+    if (m_current_textures[i])
+      m_current_textures[i]->TransitionToLayout(m_current_command_buffer, VulkanTexture::Layout::ShaderReadOnly);
+  }
 
-  const VkRenderPass render_pass =
-    GetRenderPass(m_swap_chain->GetImageFormat(), VK_FORMAT_UNDEFINED, VK_SAMPLE_COUNT_1_BIT,
-                  VK_ATTACHMENT_LOAD_OP_CLEAR, VK_ATTACHMENT_STORE_OP_STORE);
-  DebugAssert(render_pass);
-
-  const VkRenderPassBeginInfo rp = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+  VkClearValue clear_value;
+  GSVector4::store<false>(&clear_value.color.float32, GSVector4::unorm8(clear_color));
+  if (m_optional_extensions.vk_khr_dynamic_rendering)
+  {
+    VkRenderingAttachmentInfo ai = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR,
                                     nullptr,
-                                    render_pass,
-                                    m_swap_chain->GetCurrentFramebuffer(),
-                                    {{0, 0}, {m_swap_chain->GetWidth(), m_swap_chain->GetHeight()}},
-                                    1u,
-                                    &s_present_clear_color};
-  vkCmdBeginRenderPass(GetCurrentCommandBuffer(), &rp, VK_SUBPASS_CONTENTS_INLINE);
-  m_current_render_pass = render_pass;
-  m_current_framebuffer = nullptr;
+                                    swap_chain->GetCurrentImageView(),
+                                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_RESOLVE_MODE_NONE_KHR,
+                                    VK_NULL_HANDLE,
+                                    VK_IMAGE_LAYOUT_UNDEFINED,
+                                    VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                    VK_ATTACHMENT_STORE_OP_STORE,
+                                    clear_value};
 
-  // Clear pipeline, it's likely incompatible.
-  m_current_pipeline = nullptr;
+    const VkRenderingInfoKHR ri = {VK_STRUCTURE_TYPE_RENDERING_INFO_KHR,
+                                   nullptr,
+                                   0u,
+                                   {{}, {swap_chain->GetPostRotatedWidth(), swap_chain->GetPostRotatedHeight()}},
+                                   1u,
+                                   0u,
+                                   1u,
+                                   &ai,
+                                   nullptr,
+                                   nullptr};
+
+    m_current_render_pass = DYNAMIC_RENDERING_RENDER_PASS;
+    vkCmdBeginRenderingKHR(m_current_command_buffer, &ri);
+  }
+  else
+  {
+    m_current_render_pass =
+      GetSwapChainRenderPass(swap_chain->GetWindowInfo().surface_format, VK_ATTACHMENT_LOAD_OP_CLEAR);
+    DebugAssert(m_current_render_pass);
+
+    const VkRenderPassBeginInfo rp = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+                                      nullptr,
+                                      m_current_render_pass,
+                                      swap_chain->GetCurrentFramebuffer(),
+                                      {{0, 0}, {swap_chain->GetPostRotatedWidth(), swap_chain->GetPostRotatedHeight()}},
+                                      1u,
+                                      &clear_value};
+    vkCmdBeginRenderPass(m_current_command_buffer, &rp, VK_SUBPASS_CONTENTS_INLINE);
+  }
+
+  m_dirty_flags |=
+    (m_current_render_pass_flags & (GPUPipeline::ColorFeedbackLoop | GPUPipeline::BindRenderTargetsAsImages)) ?
+      DIRTY_FLAG_PIPELINE_LAYOUT :
+      0;
+  s_stats.num_render_passes++;
+  m_num_current_render_targets = 0;
+  m_current_render_pass_flags = GPUPipeline::NoRenderPassFlags;
+  std::memset(m_current_render_targets.data(), 0, sizeof(m_current_render_targets));
+  m_current_depth_target = nullptr;
+  m_current_framebuffer = VK_NULL_HANDLE;
+  m_current_swap_chain = swap_chain;
 }
 
 bool VulkanDevice::InRenderPass()
@@ -2860,32 +3072,10 @@ void VulkanDevice::EndRenderPass()
   DebugAssert(m_current_render_pass != VK_NULL_HANDLE);
 
   // TODO: stats
-  m_current_render_pass = VK_NULL_HANDLE;
-
-  vkCmdEndRenderPass(GetCurrentCommandBuffer());
-}
-
-void VulkanDevice::UnbindFramebuffer(VulkanFramebuffer* fb)
-{
-  if (m_current_framebuffer != fb)
-    return;
-
-  if (InRenderPass())
-    EndRenderPass();
-  m_current_framebuffer = nullptr;
-}
-
-void VulkanDevice::UnbindFramebuffer(VulkanTexture* tex)
-{
-  if (!m_current_framebuffer)
-    return;
-
-  if (m_current_framebuffer->GetRT() != tex && m_current_framebuffer->GetDS() != tex)
-    return;
-
-  if (InRenderPass())
-    EndRenderPass();
-  m_current_framebuffer = nullptr;
+  if (std::exchange(m_current_render_pass, VK_NULL_HANDLE) == DYNAMIC_RENDERING_RENDER_PASS)
+    vkCmdEndRenderingKHR(m_current_command_buffer);
+  else
+    vkCmdEndRenderPass(m_current_command_buffer);
 }
 
 void VulkanDevice::SetPipeline(GPUPipeline* pipeline)
@@ -2907,7 +3097,10 @@ void VulkanDevice::SetPipeline(GPUPipeline* pipeline)
 
   m_current_pipeline = static_cast<VulkanPipeline*>(pipeline);
 
-  vkCmdBindPipeline(m_current_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_current_pipeline->GetPipeline());
+  vkCmdBindPipeline(m_current_command_buffer,
+                    IsComputeLayout(m_current_pipeline->GetLayout()) ? VK_PIPELINE_BIND_POINT_COMPUTE :
+                                                                       VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    m_current_pipeline->GetPipeline());
 
   if (m_current_pipeline_layout != m_current_pipeline->GetLayout())
   {
@@ -2926,15 +3119,34 @@ void VulkanDevice::UnbindPipeline(VulkanPipeline* pl)
 
 void VulkanDevice::InvalidateCachedState()
 {
-  m_dirty_flags = ALL_DIRTY_STATE;
-  m_current_render_pass = VK_NULL_HANDLE;
-  m_current_framebuffer = nullptr;
-  m_current_pipeline = nullptr;
+  DebugAssert(!m_current_render_pass);
+  m_dirty_flags = ALL_DIRTY_STATE |
+                  ((m_current_render_pass_flags & GPUPipeline::ColorFeedbackLoop) ? DIRTY_FLAG_INPUT_ATTACHMENT : 0);
 }
 
-VkPipelineLayout VulkanDevice::GetCurrentVkPipelineLayout() const
+s32 VulkanDevice::IsRenderTargetBoundIndex(const GPUTexture* tex) const
 {
-  return m_pipeline_layouts[static_cast<u8>(m_current_pipeline_layout)];
+  for (u32 i = 0; i < m_num_current_render_targets; i++)
+  {
+    if (m_current_render_targets[i] == tex)
+      return static_cast<s32>(i);
+  }
+
+  return -1;
+}
+
+VulkanDevice::PipelineLayoutType VulkanDevice::GetPipelineLayoutType(GPUPipeline::RenderPassFlag flags)
+{
+  return (flags & GPUPipeline::BindRenderTargetsAsImages) ?
+           PipelineLayoutType::BindRenderTargetsAsImages :
+           ((flags & GPUPipeline::ColorFeedbackLoop) ? PipelineLayoutType::ColorFeedbackLoop :
+                                                       PipelineLayoutType::Normal);
+}
+
+VkPipelineLayout VulkanDevice::GetCurrentVkPipelineLayout(bool is_compute) const
+{
+  return m_pipeline_layouts[is_compute ? 0 : static_cast<size_t>(GetPipelineLayoutType(m_current_render_pass_flags))]
+                           [static_cast<size_t>(m_current_pipeline_layout)];
 }
 
 void VulkanDevice::SetInitialPipelineState()
@@ -2943,32 +3155,31 @@ void VulkanDevice::SetInitialPipelineState()
   m_dirty_flags &= ~DIRTY_FLAG_INITIAL;
 
   const VkDeviceSize offset = 0;
-  const VkCommandBuffer cmdbuf = GetCurrentCommandBuffer();
-  vkCmdBindVertexBuffers(cmdbuf, 0, 1, m_vertex_buffer.GetBufferPtr(), &offset);
-  vkCmdBindIndexBuffer(cmdbuf, m_index_buffer.GetBuffer(), 0, VK_INDEX_TYPE_UINT16);
+  vkCmdBindVertexBuffers(m_current_command_buffer, 0, 1, m_vertex_buffer.GetBufferPtr(), &offset);
+  vkCmdBindIndexBuffer(m_current_command_buffer, m_index_buffer.GetBuffer(), 0, VK_INDEX_TYPE_UINT16);
 
   m_current_pipeline_layout = m_current_pipeline->GetLayout();
-  vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, m_current_pipeline->GetPipeline());
+  vkCmdBindPipeline(m_current_command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_current_pipeline->GetPipeline());
 
   const VkViewport vp = {static_cast<float>(m_current_viewport.left),
                          static_cast<float>(m_current_viewport.top),
-                         static_cast<float>(m_current_viewport.GetWidth()),
-                         static_cast<float>(m_current_viewport.GetHeight()),
+                         static_cast<float>(m_current_viewport.width()),
+                         static_cast<float>(m_current_viewport.height()),
                          0.0f,
                          1.0f};
-  vkCmdSetViewport(GetCurrentCommandBuffer(), 0, 1, &vp);
+  vkCmdSetViewport(m_current_command_buffer, 0, 1, &vp);
 
-  const VkRect2D vrc = {
-    {m_current_scissor.left, m_current_scissor.top},
-    {static_cast<u32>(m_current_scissor.GetWidth()), static_cast<u32>(m_current_scissor.GetHeight())}};
-  vkCmdSetScissor(GetCurrentCommandBuffer(), 0, 1, &vrc);
+  const GSVector4i clamped_rc = m_current_scissor.max_s32(GSVector4i::zero());
+  const VkRect2D vrc = {{clamped_rc.x, clamped_rc.y},
+                        {static_cast<u32>(clamped_rc.width()), static_cast<u32>(clamped_rc.height())}};
+  vkCmdSetScissor(m_current_command_buffer, 0, 1, &vrc);
 }
 
 void VulkanDevice::SetTextureSampler(u32 slot, GPUTexture* texture, GPUSampler* sampler)
 {
-  VulkanTexture* T = texture ? static_cast<VulkanTexture*>(texture) : m_null_texture.get();
-  const VkSampler vsampler = static_cast<VulkanSampler*>(sampler ? sampler : m_nearest_sampler.get())->GetSampler();
-  if (m_current_textures[slot] != texture || m_current_samplers[slot] != vsampler)
+  VulkanTexture* T = static_cast<VulkanTexture*>(texture);
+  const VkSampler vsampler = static_cast<VulkanSampler*>(sampler ? sampler : m_nearest_sampler)->GetSampler();
+  if (m_current_textures[slot] != T || m_current_samplers[slot] != vsampler)
   {
     m_current_textures[slot] = T;
     m_current_samplers[slot] = vsampler;
@@ -2977,12 +3188,13 @@ void VulkanDevice::SetTextureSampler(u32 slot, GPUTexture* texture, GPUSampler* 
 
   if (T)
   {
+    T->CommitClear();
     T->SetUseFenceCounter(GetCurrentFenceCounter());
     if (T->GetLayout() != VulkanTexture::Layout::ShaderReadOnly)
     {
       if (InRenderPass())
         EndRenderPass();
-      T->TransitionToLayout(VulkanTexture::Layout::ShaderReadOnly);
+      T->TransitionToLayout(m_current_command_buffer, VulkanTexture::Layout::ShaderReadOnly);
     }
   }
 }
@@ -3004,9 +3216,34 @@ void VulkanDevice::UnbindTexture(VulkanTexture* tex)
   {
     if (m_current_textures[i] == tex)
     {
-      m_current_textures[i] = m_null_texture.get();
+      m_current_textures[i] = nullptr;
       m_dirty_flags |= DIRTY_FLAG_TEXTURES_OR_SAMPLERS;
     }
+  }
+
+  if (tex->IsRenderTarget())
+  {
+    for (u32 i = 0; i < m_num_current_render_targets; i++)
+    {
+      if (m_current_render_targets[i] == tex)
+      {
+        DEV_LOG("Unbinding current RT");
+        SetRenderTargets(nullptr, 0, m_current_depth_target);
+        break;
+      }
+    }
+
+    m_framebuffer_manager.RemoveRTReferences(tex);
+  }
+  else if (tex->IsDepthStencil())
+  {
+    if (m_current_depth_target == tex)
+    {
+      DEV_LOG("Unbinding current DS");
+      SetRenderTargets(nullptr, 0, nullptr);
+    }
+
+    m_framebuffer_manager.RemoveDSReferences(tex);
   }
 }
 
@@ -3021,10 +3258,9 @@ void VulkanDevice::UnbindTextureBuffer(VulkanTextureBuffer* buf)
     m_dirty_flags |= DIRTY_FLAG_TEXTURES_OR_SAMPLERS;
 }
 
-void VulkanDevice::SetViewport(s32 x, s32 y, s32 width, s32 height)
+void VulkanDevice::SetViewport(const GSVector4i rc)
 {
-  const Common::Rectangle<s32> rc = Common::Rectangle<s32>::FromExtents(x, y, width, height);
-  if (m_current_viewport == rc)
+  if (m_current_viewport.eq(rc))
     return;
 
   m_current_viewport = rc;
@@ -3032,15 +3268,18 @@ void VulkanDevice::SetViewport(s32 x, s32 y, s32 width, s32 height)
   if (m_dirty_flags & DIRTY_FLAG_INITIAL)
     return;
 
-  const VkViewport vp = {
-    static_cast<float>(x), static_cast<float>(y), static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
-  vkCmdSetViewport(GetCurrentCommandBuffer(), 0, 1, &vp);
+  const VkViewport vp = {static_cast<float>(rc.x),
+                         static_cast<float>(rc.y),
+                         static_cast<float>(rc.width()),
+                         static_cast<float>(rc.height()),
+                         0.0f,
+                         1.0f};
+  vkCmdSetViewport(m_current_command_buffer, 0, 1, &vp);
 }
 
-void VulkanDevice::SetScissor(s32 x, s32 y, s32 width, s32 height)
+void VulkanDevice::SetScissor(const GSVector4i rc)
 {
-  const Common::Rectangle<s32> rc = Common::Rectangle<s32>::FromExtents(x, y, width, height);
-  if (m_current_scissor == rc)
+  if (m_current_scissor.eq(rc))
     return;
 
   m_current_scissor = rc;
@@ -3048,52 +3287,112 @@ void VulkanDevice::SetScissor(s32 x, s32 y, s32 width, s32 height)
   if (m_dirty_flags & DIRTY_FLAG_INITIAL)
     return;
 
-  const VkRect2D vrc = {{x, y}, {static_cast<u32>(width), static_cast<u32>(height)}};
-  vkCmdSetScissor(GetCurrentCommandBuffer(), 0, 1, &vrc);
+  const GSVector4i clamped_rc = rc.max_s32(GSVector4i::zero());
+  const VkRect2D vrc = {{clamped_rc.x, clamped_rc.y},
+                        {static_cast<u32>(clamped_rc.width()), static_cast<u32>(clamped_rc.height())}};
+  vkCmdSetScissor(m_current_command_buffer, 0, 1, &vrc);
 }
 
 void VulkanDevice::PreDrawCheck()
 {
-  DebugAssert(!(m_dirty_flags & DIRTY_FLAG_INITIAL));
-  const u32 dirty = std::exchange(m_dirty_flags, 0);
-  if (dirty != 0)
-  {
-    if (dirty & (DIRTY_FLAG_PIPELINE_LAYOUT | DIRTY_FLAG_DYNAMIC_OFFSETS | DIRTY_FLAG_TEXTURES_OR_SAMPLERS))
-    {
-      if (!UpdateDescriptorSets(dirty))
-      {
-        SubmitCommandBufferAndRestartRenderPass("out of descriptor sets");
-        PreDrawCheck();
-        return;
-      }
-    }
-  }
-
   if (!InRenderPass())
     BeginRenderPass();
+
+  DebugAssert(!(m_dirty_flags & DIRTY_FLAG_INITIAL));
+  const u32 update_mask = (m_current_render_pass_flags ? ~0u : ~DIRTY_FLAG_INPUT_ATTACHMENT);
+  const u32 dirty = m_dirty_flags & update_mask;
+  m_dirty_flags = m_dirty_flags & ~update_mask;
+
+  if (dirty != 0)
+  {
+    if (!UpdateDescriptorSets(dirty))
+    {
+      SubmitCommandBufferAndRestartRenderPass("out of descriptor sets");
+      PreDrawCheck();
+      return;
+    }
+  }
+}
+
+void VulkanDevice::PreDispatchCheck()
+{
+  // All textures should be in shader read only optimal already, but just in case..
+  const u32 num_textures = GetActiveTexturesForLayout(m_current_pipeline_layout);
+  for (u32 i = 0; i < num_textures; i++)
+  {
+    if (m_current_textures[i])
+      m_current_textures[i]->TransitionToLayout(m_current_command_buffer, VulkanTexture::Layout::ShaderReadOnly);
+  }
+
+  // Binding as image, but we still need to clear it.
+  for (u32 i = 0; i < m_num_current_render_targets; i++)
+  {
+    VulkanTexture* rt = m_current_render_targets[i];
+    if (rt->GetState() == GPUTexture::State::Cleared)
+      rt->CommitClear(m_current_command_buffer);
+    rt->SetState(GPUTexture::State::Dirty);
+    rt->TransitionToLayout(m_current_command_buffer, VulkanTexture::Layout::ReadWriteImage);
+    rt->SetUseFenceCounter(GetCurrentFenceCounter());
+  }
+
+  // If this is a new command buffer, bind the pipeline and such.
+  if (m_dirty_flags & DIRTY_FLAG_INITIAL)
+    SetInitialPipelineState();
+
+  DebugAssert(!(m_dirty_flags & DIRTY_FLAG_INITIAL));
+  const u32 update_mask = (m_current_render_pass_flags ? ~0u : ~DIRTY_FLAG_INPUT_ATTACHMENT);
+  const u32 dirty = m_dirty_flags & update_mask;
+  m_dirty_flags = m_dirty_flags & ~update_mask;
+
+  if (dirty != 0)
+  {
+    if (!UpdateDescriptorSets(dirty))
+    {
+      SubmitCommandBuffer(false, "out of descriptor sets");
+      PreDispatchCheck();
+      return;
+    }
+  }
 }
 
 template<GPUPipeline::Layout layout>
-bool VulkanDevice::UpdateDescriptorSetsForLayout(bool new_layout, bool new_dynamic_offsets)
+bool VulkanDevice::UpdateDescriptorSetsForLayout(u32 dirty)
 {
-  std::array<VkDescriptorSet, 2> ds;
+  [[maybe_unused]] bool new_dynamic_offsets = false;
+
+  constexpr bool is_compute = IsComputeLayout(layout);
+  constexpr VkPipelineBindPoint vk_bind_point =
+    (is_compute ? VK_PIPELINE_BIND_POINT_COMPUTE : VK_PIPELINE_BIND_POINT_GRAPHICS);
+  const VkPipelineLayout vk_pipeline_layout = GetCurrentVkPipelineLayout(is_compute);
+  std::array<VkDescriptorSet, 3> ds;
   u32 first_ds = 0;
   u32 num_ds = 0;
 
-  if constexpr (layout == GPUPipeline::Layout::SingleTextureAndUBO || layout == GPUPipeline::Layout::MultiTextureAndUBO)
+  if constexpr (layout == GPUPipeline::Layout::SingleTextureAndUBO ||
+                layout == GPUPipeline::Layout::MultiTextureAndUBO ||
+                layout == GPUPipeline::Layout::MultiTextureAndUBOAndPushConstants ||
+                layout == GPUPipeline::Layout::ComputeMultiTextureAndUBO)
   {
-    if (new_layout || new_dynamic_offsets)
+    new_dynamic_offsets = ((dirty & DIRTY_FLAG_DYNAMIC_OFFSETS) != 0);
+
+    if (dirty & (DIRTY_FLAG_PIPELINE_LAYOUT | DIRTY_FLAG_DYNAMIC_OFFSETS))
     {
       ds[num_ds++] = m_ubo_descriptor_set;
       new_dynamic_offsets = true;
+    }
+    else
+    {
+      first_ds++;
     }
   }
 
   if constexpr (layout == GPUPipeline::Layout::SingleTextureAndUBO ||
                 layout == GPUPipeline::Layout::SingleTextureAndPushConstants)
   {
-    DebugAssert(m_current_textures[0] && m_current_samplers[0] != VK_NULL_HANDLE);
-    ds[num_ds++] = m_current_textures[0]->GetDescriptorSetWithSampler(m_current_samplers[0]);
+    VulkanTexture* const tex =
+      m_current_textures[0] ? m_current_textures[0] : static_cast<VulkanTexture*>(m_empty_texture.get());
+    DebugAssert(tex && m_current_samplers[0] != VK_NULL_HANDLE);
+    ds[num_ds++] = tex->GetDescriptorSetWithSampler(m_current_samplers[0]);
   }
   else if constexpr (layout == GPUPipeline::Layout::SingleTextureBufferAndPushConstants)
   {
@@ -3101,7 +3400,10 @@ bool VulkanDevice::UpdateDescriptorSetsForLayout(bool new_layout, bool new_dynam
     ds[num_ds++] = m_current_texture_buffer->GetDescriptorSet();
   }
   else if constexpr (layout == GPUPipeline::Layout::MultiTextureAndUBO ||
-                     layout == GPUPipeline::Layout::MultiTextureAndPushConstants)
+                     layout == GPUPipeline::Layout::MultiTextureAndPushConstants ||
+                     layout == GPUPipeline::Layout::MultiTextureAndUBOAndPushConstants ||
+                     layout == GPUPipeline::Layout::ComputeMultiTextureAndUBO ||
+                     layout == GPUPipeline::Layout::ComputeMultiTextureAndPushConstants)
   {
     Vulkan::DescriptorSetUpdateBuilder dsub;
 
@@ -3109,14 +3411,18 @@ bool VulkanDevice::UpdateDescriptorSetsForLayout(bool new_layout, bool new_dynam
     {
       for (u32 i = 0; i < MAX_TEXTURE_SAMPLERS; i++)
       {
-        DebugAssert(m_current_textures[i] && m_current_samplers[i] != VK_NULL_HANDLE);
-        dsub.AddCombinedImageSamplerDescriptorWrite(VK_NULL_HANDLE, i, m_current_textures[i]->GetView(),
-                                                    m_current_samplers[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        VulkanTexture* const tex =
+          m_current_textures[i] ? m_current_textures[i] : static_cast<VulkanTexture*>(m_empty_texture.get());
+        DebugAssert(tex && m_current_samplers[i] != VK_NULL_HANDLE);
+        dsub.AddCombinedImageSamplerDescriptorWrite(VK_NULL_HANDLE, i, tex->GetView(), m_current_samplers[i],
+                                                    tex->GetVkLayout());
       }
 
-      const u32 set = (layout == GPUPipeline::Layout::MultiTextureAndUBO) ? 1 : 0;
-      dsub.PushUpdate(GetCurrentCommandBuffer(), VK_PIPELINE_BIND_POINT_GRAPHICS,
-                      m_pipeline_layouts[static_cast<u8>(m_current_pipeline_layout)], set);
+      const u32 set = (layout == GPUPipeline::Layout::MultiTextureAndUBO ||
+                       layout == GPUPipeline::Layout::MultiTextureAndUBOAndPushConstants) ?
+                        1 :
+                        0;
+      dsub.PushUpdate(m_current_command_buffer, vk_bind_point, vk_pipeline_layout, set);
       if (num_ds == 0)
         return true;
     }
@@ -3130,18 +3436,61 @@ bool VulkanDevice::UpdateDescriptorSetsForLayout(bool new_layout, bool new_dynam
 
       for (u32 i = 0; i < MAX_TEXTURE_SAMPLERS; i++)
       {
-        DebugAssert(m_current_textures[i] && m_current_samplers[i] != VK_NULL_HANDLE);
-        dsub.AddCombinedImageSamplerDescriptorWrite(tds, i, m_current_textures[i]->GetView(), m_current_samplers[i],
-                                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        VulkanTexture* const tex =
+          m_current_textures[i] ? m_current_textures[i] : static_cast<VulkanTexture*>(m_empty_texture.get());
+        DebugAssert(tex && m_current_samplers[i] != VK_NULL_HANDLE);
+        dsub.AddCombinedImageSamplerDescriptorWrite(tds, i, tex->GetView(), m_current_samplers[i], tex->GetVkLayout());
       }
 
       dsub.Update(m_device, false);
     }
   }
 
+  if (m_num_current_render_targets > 0 &&
+      ((dirty & DIRTY_FLAG_INPUT_ATTACHMENT) ||
+       (dirty & DIRTY_FLAG_PIPELINE_LAYOUT &&
+        (m_current_render_pass_flags & (GPUPipeline::ColorFeedbackLoop | GPUPipeline::BindRenderTargetsAsImages)))))
+  {
+    if (m_current_render_pass_flags & GPUPipeline::BindRenderTargetsAsImages)
+    {
+      VkDescriptorSet ids = AllocateDescriptorSet(m_image_ds_layout);
+      if (ids == VK_NULL_HANDLE)
+        return false;
+
+      ds[num_ds++] = ids;
+
+      Vulkan::DescriptorSetUpdateBuilder dsub;
+      for (u32 i = 0; i < m_num_current_render_targets; i++)
+      {
+        dsub.AddStorageImageDescriptorWrite(ids, i, m_current_render_targets[i]->GetView(),
+                                            m_current_render_targets[i]->GetVkLayout());
+      }
+
+      // Annoyingly, have to update all slots...
+      const VkImageView null_view = static_cast<VulkanTexture*>(m_empty_texture.get())->GetView();
+      const VkImageLayout null_layout = static_cast<VulkanTexture*>(m_empty_texture.get())->GetVkLayout();
+      for (u32 i = m_num_current_render_targets; i < MAX_IMAGE_RENDER_TARGETS; i++)
+        dsub.AddStorageImageDescriptorWrite(ids, i, null_view, null_layout);
+
+      dsub.Update(m_device, false);
+    }
+    else
+    {
+      VkDescriptorSet ids = AllocateDescriptorSet(m_feedback_loop_ds_layout);
+      if (ids == VK_NULL_HANDLE)
+        return false;
+
+      ds[num_ds++] = ids;
+
+      Vulkan::DescriptorSetUpdateBuilder dsub;
+      dsub.AddInputAttachmentDescriptorWrite(ids, 0, m_current_render_targets[0]->GetView(),
+                                             m_current_render_targets[0]->GetVkLayout());
+      dsub.Update(m_device, false);
+    }
+  }
+
   DebugAssert(num_ds > 0);
-  vkCmdBindDescriptorSets(GetCurrentCommandBuffer(), VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          m_pipeline_layouts[static_cast<u8>(m_current_pipeline_layout)], first_ds, num_ds, ds.data(),
+  vkCmdBindDescriptorSets(m_current_command_buffer, vk_bind_point, vk_pipeline_layout, first_ds, num_ds, ds.data(),
                           static_cast<u32>(new_dynamic_offsets),
                           new_dynamic_offsets ? &m_uniform_buffer_position : nullptr);
 
@@ -3150,25 +3499,31 @@ bool VulkanDevice::UpdateDescriptorSetsForLayout(bool new_layout, bool new_dynam
 
 bool VulkanDevice::UpdateDescriptorSets(u32 dirty)
 {
-  const bool new_layout = (dirty & DIRTY_FLAG_PIPELINE_LAYOUT) != 0;
-  const bool new_dynamic_offsets = (dirty & DIRTY_FLAG_DYNAMIC_OFFSETS) != 0;
-
   switch (m_current_pipeline_layout)
   {
     case GPUPipeline::Layout::SingleTextureAndUBO:
-      return UpdateDescriptorSetsForLayout<GPUPipeline::Layout::SingleTextureAndUBO>(new_layout, new_dynamic_offsets);
+      return UpdateDescriptorSetsForLayout<GPUPipeline::Layout::SingleTextureAndUBO>(dirty);
 
     case GPUPipeline::Layout::SingleTextureAndPushConstants:
-      return UpdateDescriptorSetsForLayout<GPUPipeline::Layout::SingleTextureAndPushConstants>(new_layout, false);
+      return UpdateDescriptorSetsForLayout<GPUPipeline::Layout::SingleTextureAndPushConstants>(dirty);
 
     case GPUPipeline::Layout::SingleTextureBufferAndPushConstants:
-      return UpdateDescriptorSetsForLayout<GPUPipeline::Layout::SingleTextureBufferAndPushConstants>(new_layout, false);
+      return UpdateDescriptorSetsForLayout<GPUPipeline::Layout::SingleTextureBufferAndPushConstants>(dirty);
 
     case GPUPipeline::Layout::MultiTextureAndUBO:
-      return UpdateDescriptorSetsForLayout<GPUPipeline::Layout::MultiTextureAndUBO>(new_layout, new_dynamic_offsets);
+      return UpdateDescriptorSetsForLayout<GPUPipeline::Layout::MultiTextureAndUBO>(dirty);
 
     case GPUPipeline::Layout::MultiTextureAndPushConstants:
-      return UpdateDescriptorSetsForLayout<GPUPipeline::Layout::MultiTextureAndPushConstants>(new_layout, false);
+      return UpdateDescriptorSetsForLayout<GPUPipeline::Layout::MultiTextureAndPushConstants>(dirty);
+
+    case GPUPipeline::Layout::MultiTextureAndUBOAndPushConstants:
+      return UpdateDescriptorSetsForLayout<GPUPipeline::Layout::MultiTextureAndUBOAndPushConstants>(dirty);
+
+    case GPUPipeline::Layout::ComputeMultiTextureAndUBO:
+      return UpdateDescriptorSetsForLayout<GPUPipeline::Layout::ComputeMultiTextureAndUBO>(dirty);
+
+    case GPUPipeline::Layout::ComputeMultiTextureAndPushConstants:
+      return UpdateDescriptorSetsForLayout<GPUPipeline::Layout::ComputeMultiTextureAndPushConstants>(dirty);
 
     default:
       UnreachableCode();
@@ -3178,11 +3533,147 @@ bool VulkanDevice::UpdateDescriptorSets(u32 dirty)
 void VulkanDevice::Draw(u32 vertex_count, u32 base_vertex)
 {
   PreDrawCheck();
-  vkCmdDraw(GetCurrentCommandBuffer(), vertex_count, 1, base_vertex, 0);
+  s_stats.num_draws++;
+  vkCmdDraw(m_current_command_buffer, vertex_count, 1, base_vertex, 0);
+}
+
+void VulkanDevice::DrawWithPushConstants(u32 vertex_count, u32 base_vertex, const void* push_constants,
+                                         u32 push_constants_size)
+{
+  PreDrawCheck();
+  s_stats.num_draws++;
+
+  PushUniformBuffer(false, push_constants, push_constants_size);
+  vkCmdDraw(m_current_command_buffer, vertex_count, 1, base_vertex, 0);
 }
 
 void VulkanDevice::DrawIndexed(u32 index_count, u32 base_index, u32 base_vertex)
 {
   PreDrawCheck();
-  vkCmdDrawIndexed(GetCurrentCommandBuffer(), index_count, 1, base_index, base_vertex, 0);
+  s_stats.num_draws++;
+  vkCmdDrawIndexed(m_current_command_buffer, index_count, 1, base_index, base_vertex, 0);
+}
+
+void VulkanDevice::DrawIndexedWithPushConstants(u32 index_count, u32 base_index, u32 base_vertex,
+                                                const void* push_constants, u32 push_constants_size)
+{
+  PreDrawCheck();
+  s_stats.num_draws++;
+  PushUniformBuffer(false, push_constants, push_constants_size);
+  vkCmdDrawIndexed(m_current_command_buffer, index_count, 1, base_index, base_vertex, 0);
+}
+
+VkImageMemoryBarrier VulkanDevice::GetColorBufferBarrier(const VulkanTexture* rt) const
+{
+  const VkImageLayout vk_layout = m_optional_extensions.vk_khr_dynamic_rendering_local_read ?
+                                    VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR :
+                                    VK_IMAGE_LAYOUT_GENERAL;
+  DebugAssert(rt->GetLayout() == VulkanTexture::Layout::FeedbackLoop);
+
+  return {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+          nullptr,
+          VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+          VK_ACCESS_INPUT_ATTACHMENT_READ_BIT,
+          vk_layout,
+          vk_layout,
+          VK_QUEUE_FAMILY_IGNORED,
+          VK_QUEUE_FAMILY_IGNORED,
+          rt->GetImage(),
+          {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u}};
+}
+
+void VulkanDevice::DrawIndexedWithBarrier(u32 index_count, u32 base_index, u32 base_vertex, DrawBarrier type)
+{
+  PreDrawCheck();
+  SubmitDrawIndexedWithBarrier(index_count, base_index, base_vertex, type);
+}
+
+void VulkanDevice::DrawIndexedWithBarrierWithPushConstants(u32 index_count, u32 base_index, u32 base_vertex,
+                                                           const void* push_constants, u32 push_constants_size,
+                                                           DrawBarrier type)
+{
+  PreDrawCheck();
+  PushUniformBuffer(false, push_constants, push_constants_size);
+  SubmitDrawIndexedWithBarrier(index_count, base_index, base_vertex, type);
+}
+
+void VulkanDevice::SubmitDrawIndexedWithBarrier(u32 index_count, u32 base_index, u32 base_vertex, DrawBarrier type)
+{
+  DebugAssert(m_current_pipeline->GetRenderPassFlags() & GPUPipeline::ColorFeedbackLoopActive);
+
+  switch (type)
+  {
+    case GPUDevice::DrawBarrier::None:
+    {
+      s_stats.num_draws++;
+      vkCmdDrawIndexed(m_current_command_buffer, index_count, 1, base_index, base_vertex, 0);
+    }
+    break;
+
+    case GPUDevice::DrawBarrier::One:
+    {
+      DebugAssert(m_num_current_render_targets == 1);
+      s_stats.num_barriers++;
+      s_stats.num_draws++;
+
+      const VkImageMemoryBarrier barrier =
+        GetColorBufferBarrier(static_cast<VulkanTexture*>(m_current_render_targets[0]));
+      vkCmdPipelineBarrier(m_current_command_buffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 0, nullptr, 0, nullptr,
+                           1, &barrier);
+      vkCmdDrawIndexed(m_current_command_buffer, index_count, 1, base_index, base_vertex, 0);
+    }
+    break;
+
+    case GPUDevice::DrawBarrier::Full:
+    {
+      DebugAssert(m_num_current_render_targets == 1);
+
+      const VkImageMemoryBarrier barrier =
+        GetColorBufferBarrier(static_cast<VulkanTexture*>(m_current_render_targets[0]));
+      const u32 indices_per_primitive = m_current_pipeline->GetVerticesPerPrimitive();
+      const u32 end_batch = base_index + index_count;
+
+      for (; base_index < end_batch; base_index += indices_per_primitive)
+      {
+        s_stats.num_barriers++;
+        s_stats.num_draws++;
+
+        vkCmdPipelineBarrier(m_current_command_buffer, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 0, nullptr, 0, nullptr,
+                             1, &barrier);
+        vkCmdDrawIndexed(m_current_command_buffer, indices_per_primitive, 1, base_index, base_vertex, 0);
+      }
+    }
+    break;
+
+      DefaultCaseIsUnreachable();
+  }
+}
+
+void VulkanDevice::Dispatch(u32 threads_x, u32 threads_y, u32 threads_z, u32 group_size_x, u32 group_size_y,
+                            u32 group_size_z)
+{
+  PreDispatchCheck();
+  s_stats.num_draws++;
+
+  const u32 groups_x = threads_x / group_size_x;
+  const u32 groups_y = threads_y / group_size_y;
+  const u32 groups_z = threads_z / group_size_z;
+  vkCmdDispatch(m_current_command_buffer, groups_x, groups_y, groups_z);
+}
+
+void VulkanDevice::DispatchWithPushConstants(u32 threads_x, u32 threads_y, u32 threads_z, u32 group_size_x,
+                                             u32 group_size_y, u32 group_size_z, const void* push_constants,
+                                             u32 push_constants_size)
+{
+  PreDispatchCheck();
+  s_stats.num_draws++;
+
+  PushUniformBuffer(true, push_constants, push_constants_size);
+
+  const u32 groups_x = threads_x / group_size_x;
+  const u32 groups_y = threads_y / group_size_y;
+  const u32 groups_z = threads_z / group_size_z;
+  vkCmdDispatch(m_current_command_buffer, groups_x, groups_y, groups_z);
 }

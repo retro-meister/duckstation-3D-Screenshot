@@ -1,23 +1,16 @@
-// SPDX-FileCopyrightText: 2019-2022 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
-#include "types.h"
-#include <type_traits>
 
-// Disable MSVC warnings that we actually handle
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4800) // warning C4800: 'int': forcing value to bool 'true' or 'false' (performance warning)
-#endif
+#include "types.h"
+
+#include <type_traits>
 
 template<typename BackingDataType, typename DataType, unsigned BitIndex, unsigned BitCount>
 struct BitField
 {
   static_assert(!std::is_same_v<DataType, bool> || BitCount == 1, "Boolean bitfields should only be 1 bit");
-
-  // We have to delete the copy assignment operator otherwise we can't use this class in anonymous structs/unions.
-  BitField& operator=(const BitField& rhs) = delete;
 
   ALWAYS_INLINE constexpr BackingDataType GetMask() const
   {
@@ -138,7 +131,3 @@ struct BitField
 
   BackingDataType data;
 };
-
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif

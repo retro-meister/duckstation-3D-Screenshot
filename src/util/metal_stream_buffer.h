@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 
@@ -18,6 +18,8 @@
 
 #include <deque>
 #include <memory>
+
+class Error;
 
 class MetalStreamBuffer
 {
@@ -38,7 +40,7 @@ public:
   ALWAYS_INLINE u32 GetCurrentSpace() const { return m_current_space; }
   ALWAYS_INLINE u32 GetCurrentOffset() const { return m_current_offset; }
 
-  bool Create(id<MTLDevice> device, u32 size);
+  bool Create(id<MTLDevice> device, u32 size, Error* error);
   void Destroy();
 
   bool ReserveMemory(u32 num_bytes, u32 alignment);

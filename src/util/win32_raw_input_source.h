@@ -1,9 +1,12 @@
-// SPDX-FileCopyrightText: 2019-2022 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
-#include "common/windows_headers.h"
+
 #include "input_source.h"
+
+#include "common/windows_headers.h"
+
 #include <array>
 #include <functional>
 #include <mutex>
@@ -17,23 +20,30 @@ public:
   Win32RawInputSource();
   ~Win32RawInputSource();
 
-  bool Initialize(SettingsInterface& si, std::unique_lock<std::mutex>& settings_lock) override;
-  void UpdateSettings(SettingsInterface& si, std::unique_lock<std::mutex>& settings_lock) override;
+  bool Initialize(const SettingsInterface& si, std::unique_lock<std::mutex>& settings_lock) override;
+  void UpdateSettings(const SettingsInterface& si, std::unique_lock<std::mutex>& settings_lock) override;
   bool ReloadDevices() override;
   void Shutdown() override;
 
   void PollEvents() override;
-  std::vector<std::pair<std::string, std::string>> EnumerateDevices() override;
-  std::vector<InputBindingKey> EnumerateMotors() override;
-  bool GetGenericBindingMapping(const std::string_view& device, GenericInputBindingMapping* mapping) override;
+  std::optional<float> GetCurrentValue(InputBindingKey key) override;
+  InputManager::DeviceList EnumerateDevices() override;
+  InputManager::DeviceEffectList EnumerateEffects(std::optional<InputBindingInfo::Type> type,
+                                                  std::optional<InputBindingKey> for_device) override;
+  u32 GetPollableDeviceCount() const override;
+  bool GetGenericBindingMapping(std::string_view device, GenericInputBindingMapping* mapping) override;
   void UpdateMotorState(InputBindingKey key, float intensity) override;
   void UpdateMotorState(InputBindingKey large_key, InputBindingKey small_key, float large_intensity,
                         float small_intensity) override;
+  void UpdateLEDState(InputBindingKey key, float intensity) override;
 
-  std::optional<InputBindingKey> ParseKeyString(const std::string_view& device,
-                                                const std::string_view& binding) override;
+  bool ContainsDevice(std::string_view device) const override;
+  std::optional<InputBindingKey> ParseKeyString(std::string_view device, std::string_view binding) override;
   TinyString ConvertKeyToString(InputBindingKey key) override;
-  TinyString ConvertKeyToIcon(InputBindingKey key) override;
+  TinyString ConvertKeyToDisplayString(InputBindingKey key, bool allow_icon,
+                                       InputManager::BindingIconMappingFunction mapper) override;
+  void SetSubclassPollDeviceList(InputSubclass subclass, const std::span<const InputBindingKey>* devices) override;
+  std::unique_ptr<ForceFeedbackDevice> CreateForceFeedbackDevice(std::string_view device, Error* error) override;
 
 private:
   struct MouseState
@@ -46,16 +56,21 @@ private:
 
   static bool RegisterDummyClass();
   static LRESULT CALLBACK DummyWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+  static bool IsAcceptableRawInputMouse(const RAWINPUTDEVICELIST& rid);
+
+  static std::string GetMouseDeviceName(u32 index);
 
   bool CreateDummyWindow();
   void DestroyDummyWindow();
-  bool OpenDevices();
   void CloseDevices();
+  void EnsureRawInputRegistered();
+  void UnregisterRawInput();
 
   bool ProcessRawInputEvent(const RAWINPUT* event);
 
   HWND m_dummy_window = {};
-  u32 m_num_keyboards = 0;
 
   std::vector<MouseState> m_mice;
+
+  bool m_raw_input_registered = false;
 };

@@ -1,16 +1,20 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "cd_image.h"
+
 #include "common/assert.h"
+#include "common/bcdutils.h"
 #include "common/bitutils.h"
 #include "common/error.h"
 #include "common/file_system.h"
 #include "common/log.h"
 #include "common/path.h"
 #include "common/string_util.h"
+
 #include <array>
-Log_SetChannel(CDImage);
+
+LOG_CHANNEL(CDImage);
 
 CDImage::CDImage() = default;
 
@@ -47,84 +51,100 @@ void CDImage::DeinterleaveSubcode(const u8* subcode_in, u8* subcode_out)
   }
 }
 
-std::unique_ptr<CDImage> CDImage::Open(const char* filename, bool allow_patches, Error* error)
+std::unique_ptr<CDImage> CDImage::Open(const char* path, bool allow_patches, Error* error)
 {
-  const char* extension;
-
+  // Annoying handling because of storage access framework.
 #ifdef __ANDROID__
-  std::string filename_display_name(FileSystem::GetDisplayNameFromPath(filename));
-  if (filename_display_name.empty())
-    filename_display_name = filename;
-
-  extension = std::strrchr(filename_display_name.c_str(), '.');
+  const std::string path_display_name = FileSystem::GetDisplayNameFromPath(path);
+  const std::string_view extension = Path::GetExtension(path_display_name);
 #else
-  extension = std::strrchr(filename, '.');
+  const std::string_view extension = Path::GetExtension(path);
 #endif
 
-  if (!extension)
-  {
-    Log_ErrorPrintf("Invalid filename: '%s'", filename);
-    return nullptr;
-  }
-
   std::unique_ptr<CDImage> image;
-  if (StringUtil::Strcasecmp(extension, ".cue") == 0)
+  if (extension.empty())
   {
-    image = OpenCueSheetImage(filename, error);
+    // Device filenames on Linux don't have extensions.
+    if (IsDeviceName(path))
+    {
+      image = OpenDeviceImage(path, error);
+    }
+    else
+    {
+      Error::SetStringFmt(error, "Invalid filename: '{}'", Path::GetFileName(path));
+      return nullptr;
+    }
   }
-  else if (StringUtil::Strcasecmp(extension, ".bin") == 0 || StringUtil::Strcasecmp(extension, ".img") == 0 ||
-           StringUtil::Strcasecmp(extension, ".iso") == 0)
+  else if (StringUtil::EqualNoCase(extension, "cue"))
   {
-    image = OpenBinImage(filename, error);
+    image = OpenCueSheetImage(path, error);
   }
-  else if (StringUtil::Strcasecmp(extension, ".chd") == 0)
+  else if (StringUtil::EqualNoCase(extension, "bin") || StringUtil::EqualNoCase(extension, "img") ||
+           StringUtil::EqualNoCase(extension, "iso") || StringUtil::EqualNoCase(extension, "ecm"))
   {
-    image = OpenCHDImage(filename, error);
+    image = OpenBinImage(path, error);
   }
-  else if (StringUtil::Strcasecmp(extension, ".ecm") == 0)
+  else if (StringUtil::EqualNoCase(extension, "chd"))
   {
-    image = OpenEcmImage(filename, error);
+    image = OpenCHDImage(path, error);
   }
-  else if (StringUtil::Strcasecmp(extension, ".mds") == 0)
+  else if (StringUtil::EqualNoCase(extension, "mds"))
   {
-    image = OpenMdsImage(filename, error);
+    image = OpenMdsImage(path, error);
   }
-  else if (StringUtil::Strcasecmp(extension, ".pbp") == 0)
+  else if (StringUtil::EqualNoCase(extension, "pbp"))
   {
-    image = OpenPBPImage(filename, error);
+    image = OpenPBPImage(path, error);
   }
-  else if (StringUtil::Strcasecmp(extension, ".m3u") == 0)
+  else if (StringUtil::EqualNoCase(extension, "ccd"))
   {
-    image = OpenM3uImage(filename, allow_patches, error);
+    image = OpenCCDImage(path, error);
   }
-  else if (IsDeviceName(filename))
+  else if (StringUtil::EqualNoCase(extension, "m3u"))
   {
-    image = OpenDeviceImage(filename, error);
+    // skip applying patches to the main path, which isn't a real disc
+    image = OpenM3uImage(path, allow_patches, error);
+    allow_patches = false;
+  }
+  else if (IsDeviceName(path))
+  {
+    image = OpenDeviceImage(path, error);
   }
   else
   {
-    Log_ErrorPrintf("Unknown extension '%s' from filename '%s'", extension, filename);
+    Error::SetStringFmt(error, "Unknown extension '{}' from filename '{}'", extension, Path::GetFileName(path));
     return nullptr;
   }
 
   if (allow_patches)
   {
 #ifdef __ANDROID__
-    const std::string ppf_filename(
-      Path::BuildRelativePath(filename, Path::ReplaceExtension(filename_display_name, "ppf")));
+    const std::string ppf_path = Path::BuildRelativePath(path, Path::ReplaceExtension(path_display_name, "ppf"));
 #else
-    const std::string ppf_filename(
-      Path::BuildRelativePath(filename, Path::ReplaceExtension(Path::GetFileName(filename), "ppf")));
+    const std::string ppf_path = Path::BuildRelativePath(path, Path::ReplaceExtension(Path::GetFileName(path), "ppf"));
 #endif
-    if (FileSystem::FileExists(ppf_filename.c_str()))
+    if (FileSystem::FileExists(ppf_path.c_str()))
     {
-      image = CDImage::OverlayPPFPatch(ppf_filename.c_str(), std::move(image));
+      image = CDImage::OverlayPPFPatch(ppf_path.c_str(), std::move(image), error);
       if (!image)
-        Error::SetString(error, fmt::format("Failed to apply ppf patch from '{}'.", ppf_filename));
+        Error::AddPrefixFmt(error, "Failed to apply ppf patch from '{}':\n", ppf_path);
     }
   }
 
   return image;
+}
+
+bool CDImage::HasOverlayablePatch(const char* path)
+{
+  // Annoying handling because of storage access framework.
+#ifdef __ANDROID__
+  const std::string ppf_path =
+    Path::BuildRelativePath(path, Path::ReplaceExtension(FileSystem::GetDisplayNameFromPath(path), "ppf"));
+#else
+  const std::string ppf_path = Path::BuildRelativePath(path, Path::ReplaceExtension(Path::GetFileName(path), "ppf"));
+#endif
+
+  return FileSystem::FileExists(ppf_path.c_str());
 }
 
 CDImage::LBA CDImage::GetTrackStartPosition(u8 track) const
@@ -243,43 +263,6 @@ bool CDImage::Seek(u32 track_number, LBA lba)
   return Seek(track.start_lba + lba);
 }
 
-u32 CDImage::Read(ReadMode read_mode, u32 sector_count, void* buffer)
-{
-  u8* buffer_ptr = static_cast<u8*>(buffer);
-  u32 sectors_read = 0;
-  for (; sectors_read < sector_count; sectors_read++)
-  {
-    // get raw sector
-    u8 raw_sector[RAW_SECTOR_SIZE];
-    if (!ReadRawSector(raw_sector, nullptr))
-      break;
-
-    switch (read_mode)
-    {
-      case ReadMode::DataOnly:
-        std::memcpy(buffer_ptr, raw_sector + 24, DATA_SECTOR_SIZE);
-        buffer_ptr += DATA_SECTOR_SIZE;
-        break;
-
-      case ReadMode::RawNoSync:
-        std::memcpy(buffer_ptr, raw_sector + SECTOR_SYNC_SIZE, RAW_SECTOR_SIZE - SECTOR_SYNC_SIZE);
-        buffer_ptr += RAW_SECTOR_SIZE - SECTOR_SYNC_SIZE;
-        break;
-
-      case ReadMode::RawSector:
-        std::memcpy(buffer_ptr, raw_sector, RAW_SECTOR_SIZE);
-        buffer_ptr += RAW_SECTOR_SIZE;
-        break;
-
-      default:
-        UnreachableCode();
-        break;
-    }
-  }
-
-  return sectors_read;
-}
-
 bool CDImage::ReadRawSector(void* buffer, SubChannelQ* subq)
 {
   if (m_position_in_index == m_current_index->length)
@@ -295,7 +278,7 @@ bool CDImage::ReadRawSector(void* buffer, SubChannelQ* subq)
       // TODO: This is where we'd reconstruct the header for other mode tracks.
       if (!ReadSectorFromIndex(buffer, *m_current_index, m_position_in_index))
       {
-        Log_ErrorPrintf("Read of LBA %u failed", m_position_on_disc);
+        ERROR_LOG("Read of LBA {} failed", m_position_on_disc);
         Seek(m_position_on_disc);
         return false;
       }
@@ -317,7 +300,7 @@ bool CDImage::ReadRawSector(void* buffer, SubChannelQ* subq)
 
   if (subq && !ReadSubChannelQ(subq, *m_current_index, m_position_in_index))
   {
-    Log_ErrorPrintf("Subchannel read of LBA %u failed", m_position_on_disc);
+    ERROR_LOG("Subchannel read of LBA {} failed", m_position_on_disc);
     Seek(m_position_on_disc);
     return false;
   }
@@ -334,21 +317,9 @@ bool CDImage::ReadSubChannelQ(SubChannelQ* subq, const Index& index, LBA lba_in_
   return true;
 }
 
-bool CDImage::HasNonStandardSubchannel() const
+bool CDImage::HasSubchannelData() const
 {
   return false;
-}
-
-std::string CDImage::GetMetadata(const std::string_view& type) const
-{
-  std::string result;
-  if (type == "title")
-  {
-    const std::string display_name(FileSystem::GetDisplayNameFromPath(m_filename));
-    result = Path::StripExtension(display_name);
-  }
-
-  return result;
 }
 
 bool CDImage::HasSubImages() const
@@ -371,12 +342,12 @@ bool CDImage::SwitchSubImage(u32 index, Error* error)
   return false;
 }
 
-std::string CDImage::GetSubImageMetadata(u32 index, const std::string_view& type) const
+std::string CDImage::GetSubImageTitle(u32 index) const
 {
   return {};
 }
 
-CDImage::PrecacheResult CDImage::Precache(ProgressCallback* progress /*= ProgressCallback::NullProgressCallback*/)
+CDImage::PrecacheResult CDImage::Precache(ProgressCallback* progress, Error* error)
 {
   return PrecacheResult::Unsupported;
 }
@@ -384,6 +355,11 @@ CDImage::PrecacheResult CDImage::Precache(ProgressCallback* progress /*= Progres
 bool CDImage::IsPrecached() const
 {
   return false;
+}
+
+s64 CDImage::GetSizeOnDisk() const
+{
+  return -1;
 }
 
 void CDImage::ClearTOC()
@@ -424,7 +400,7 @@ void CDImage::CopyTOC(const CDImage* image)
   m_position_on_disc = 0;
 }
 
-const CDImage::Index* CDImage::GetIndexForDiscPosition(LBA pos)
+const CDImage::Index* CDImage::GetIndexForDiscPosition(LBA pos) const
 {
   for (const Index& index : m_indices)
   {
@@ -441,7 +417,7 @@ const CDImage::Index* CDImage::GetIndexForDiscPosition(LBA pos)
   return nullptr;
 }
 
-const CDImage::Index* CDImage::GetIndexForTrackPosition(u32 track_number, LBA track_pos)
+const CDImage::Index* CDImage::GetIndexForTrackPosition(u32 track_number, LBA track_pos) const
 {
   if (track_number < 1 || track_number > m_tracks.size())
     return nullptr;
@@ -453,18 +429,18 @@ const CDImage::Index* CDImage::GetIndexForTrackPosition(u32 track_number, LBA tr
   return GetIndexForDiscPosition(track.start_lba + track_pos);
 }
 
-bool CDImage::GenerateSubChannelQ(SubChannelQ* subq, LBA lba)
+bool CDImage::GenerateSubChannelQ(SubChannelQ* subq, LBA lba) const
 {
   const Index* index = GetIndexForDiscPosition(lba);
   if (!index)
     return false;
 
-  const u32 index_offset = index->start_lba_on_disc - lba;
+  const u32 index_offset = lba - index->start_lba_on_disc;
   GenerateSubChannelQ(subq, *index, index_offset);
   return true;
 }
 
-void CDImage::GenerateSubChannelQ(SubChannelQ* subq, const Index& index, u32 index_offset)
+void CDImage::GenerateSubChannelQ(SubChannelQ* subq, const Index& index, u32 index_offset) const
 {
   subq->control_bits = index.control.bits;
   subq->track_number_bcd = (index.track_number <= m_tracks.size() ? BinaryToBCD(static_cast<u8>(index.track_number)) :
@@ -540,4 +516,73 @@ u16 CDImage::SubChannelQ::ComputeCRC(const Data& data)
 bool CDImage::SubChannelQ::IsCRCValid() const
 {
   return crc == ComputeCRC(data);
+}
+
+CDImage::Position CDImage::Position::FromBCD(u8 minute, u8 second, u8 frame)
+{
+  return Position{PackedBCDToBinary(minute), PackedBCDToBinary(second), PackedBCDToBinary(frame)};
+}
+
+CDImage::Position CDImage::Position::FromLBA(LBA lba)
+{
+  const u8 frame = Truncate8(lba % FRAMES_PER_SECOND);
+  lba /= FRAMES_PER_SECOND;
+
+  const u8 second = Truncate8(lba % SECONDS_PER_MINUTE);
+  lba /= SECONDS_PER_MINUTE;
+
+  const u8 minute = Truncate8(lba);
+
+  return Position{minute, second, frame};
+}
+
+CDImage::LBA CDImage::Position::ToLBA() const
+{
+  return ZeroExtend32(minute) * FRAMES_PER_MINUTE + ZeroExtend32(second) * FRAMES_PER_SECOND + ZeroExtend32(frame);
+}
+
+std::tuple<u8, u8, u8> CDImage::Position::ToBCD() const
+{
+  return std::make_tuple<u8, u8, u8>(BinaryToBCD(minute), BinaryToBCD(second), BinaryToBCD(frame));
+}
+
+CDImage::Position CDImage::Position::operator+(const Position& rhs)
+{
+  return FromLBA(ToLBA() + rhs.ToLBA());
+}
+
+CDImage::CDImage::Position& CDImage::Position::operator+=(const Position& pos)
+{
+  *this = *this + pos;
+  return *this;
+}
+
+bool CDImage::Position::operator<(const Position& rhs) const
+{
+  return std::tie(minute, second, frame) < std::tie(rhs.minute, rhs.second, rhs.frame);
+}
+
+bool CDImage::Position::operator<=(const Position& rhs) const
+{
+  return std::tie(minute, second, frame) <= std::tie(rhs.minute, rhs.second, rhs.frame);
+}
+
+bool CDImage::Position::operator>(const Position& rhs) const
+{
+  return std::tie(minute, second, frame) > std::tie(rhs.minute, rhs.second, rhs.frame);
+}
+
+bool CDImage::Position::operator>=(const Position& rhs) const
+{
+  return std::tie(minute, second, frame) >= std::tie(rhs.minute, rhs.second, rhs.frame);
+}
+
+bool CDImage::Position::operator!=(const Position& rhs) const
+{
+  return std::tie(minute, second, frame) != std::tie(rhs.minute, rhs.second, rhs.frame);
+}
+
+bool CDImage::Position::operator==(const Position& rhs) const
+{
+  return std::tie(minute, second, frame) == std::tie(rhs.minute, rhs.second, rhs.frame);
 }

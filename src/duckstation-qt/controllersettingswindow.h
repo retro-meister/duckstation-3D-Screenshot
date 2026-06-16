@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 
@@ -7,53 +7,59 @@
 
 #include "util/input_manager.h"
 
-#include "common/types.h"
+#include "core/types.h"
 
+#include <QtCore/QAbstractListModel>
 #include <QtCore/QList>
 #include <QtCore/QPair>
 #include <QtCore/QString>
 #include <QtCore/QStringList>
 #include <QtWidgets/QDialog>
+
 #include <array>
 #include <string>
+#include <utility>
+#include <vector>
+
+class Error;
 
 class ControllerGlobalSettingsWidget;
 class ControllerBindingWidget;
 class HotkeySettingsWidget;
 
-class SettingsInterface;
+class INISettingsInterface;
 
 class ControllerSettingsWindow final : public QWidget
 {
   Q_OBJECT
 
 public:
-  enum class Category
-  {
-    GlobalSettings,
-    FirstControllerSettings,
-    HotkeySettings,
-    Count
-  };
-
-  enum : u32
-  {
-    MAX_PORTS = 8
-  };
-
-  ControllerSettingsWindow();
+  ControllerSettingsWindow(INISettingsInterface* game_sif = nullptr, bool edit_profiles = false,
+                           QWidget* parent = nullptr);
   ~ControllerSettingsWindow();
+
+  static void editControllerSettingsForGame(QWidget* parent, INISettingsInterface* sif);
 
   ALWAYS_INLINE HotkeySettingsWidget* getHotkeySettingsWidget() const { return m_hotkey_settings; }
 
-  ALWAYS_INLINE const QList<QPair<QString, QString>>& getDeviceList() const { return m_device_list; }
-  ALWAYS_INLINE const QStringList& getVibrationMotors() const { return m_vibration_motors; }
+  ALWAYS_INLINE bool isEditingGlobalSettings() const
+  {
+    return (!m_editing_input_profiles && !m_editing_settings_interface);
+  }
+  ALWAYS_INLINE bool isEditingGameSettings() const
+  {
+    return (!m_editing_input_profiles && m_editing_settings_interface);
+  }
+  ALWAYS_INLINE bool isEditingProfile() const { return m_editing_input_profiles; }
+  ALWAYS_INLINE INISettingsInterface* getEditingSettingsInterface() { return m_editing_settings_interface; }
 
-  ALWAYS_INLINE bool isEditingGlobalSettings() const { return m_profile_name.isEmpty(); }
-  ALWAYS_INLINE bool isEditingProfile() const { return !m_profile_name.isEmpty(); }
-  ALWAYS_INLINE SettingsInterface* getProfileSettingsInterface() { return m_profile_interface.get(); }
+  int getCategoryRow() const;
+  void setCategoryRow(int row);
+  void setCategory(u32 category);
 
   void updateListDescription(u32 global_slot, ControllerBindingWidget* widget);
+
+  void switchProfile(const std::string_view name);
 
   // Helper functions for updating setting values globally or in the profile.
   bool getBoolValue(const char* section, const char* key, bool default_value) const;
@@ -63,41 +69,40 @@ public:
   void setIntValue(const char* section, const char* key, s32 value);
   void setStringValue(const char* section, const char* key, const char* value);
   void clearSettingValue(const char* section, const char* key);
+  void saveAndReloadGameSettings();
 
-Q_SIGNALS:
-  void inputProfileSwitched();
+  static constexpr u32 CATEGORY_GLOBAL_SETTINGS = 0;
+  static constexpr u32 CATEGORY_FIRST_CONTROLLER_SETTINGS = 1;
+  static constexpr u32 CATEGORY_HOTKEY_SETTINGS = 2;
 
-public Q_SLOTS:
-  void setCategory(Category category);
+protected:
+  void closeEvent(QCloseEvent* event) override;
 
-private Q_SLOTS:
-  void onCategoryCurrentRowChanged(int row);
-  void onCurrentProfileChanged(int index);
-  void onNewProfileClicked();
-  void onLoadProfileClicked();
-  void onDeleteProfileClicked();
-  void onRestoreDefaultsClicked();
+private:
+  int getHotkeyCategoryIndex() const;
+  void refreshProfileList();
 
-  void onInputDevicesEnumerated(const QList<QPair<QString, QString>>& devices);
-  void onInputDeviceConnected(const QString& identifier, const QString& device_name);
-  void onInputDeviceDisconnected(const QString& identifier);
-  void onVibrationMotorsEnumerated(const QList<InputBindingKey>& motors);
+  std::array<bool, 2> getEnabledMultitaps() const;
 
   void createWidgets();
 
-private:
-  void refreshProfileList();
-  void switchProfile(const QString& name);
+  void onCategoryCurrentRowChanged(int row);
+  void onCurrentProfileChanged(int index);
+  void onNewProfileClicked();
+  void onApplyProfileClicked();
+  void onDeleteProfileClicked();
+  void onRestoreDefaultsClicked();
+  void onCopyGlobalSettingsClicked();
 
   Ui::ControllerSettingsWindow m_ui;
 
+  INISettingsInterface* m_editing_settings_interface = nullptr;
+
   ControllerGlobalSettingsWidget* m_global_settings = nullptr;
-  std::array<ControllerBindingWidget*, MAX_PORTS> m_port_bindings{};
+  std::array<ControllerBindingWidget*, NUM_CONTROLLER_AND_CARD_PORTS> m_port_bindings{};
   HotkeySettingsWidget* m_hotkey_settings = nullptr;
 
-  QList<QPair<QString, QString>> m_device_list;
-  QStringList m_vibration_motors;
-
   QString m_profile_name;
-  std::unique_ptr<SettingsInterface> m_profile_interface;
+  std::unique_ptr<INISettingsInterface> m_profile_settings_interface;
+  bool m_editing_input_profiles = false;
 };

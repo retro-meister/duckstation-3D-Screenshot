@@ -67,7 +67,7 @@ validate_stream_params(cubeb_stream_params * input_stream_params,
   XASSERT(input_stream_params || output_stream_params);
   if (output_stream_params) {
     if (output_stream_params->rate < 1000 ||
-        output_stream_params->rate > 192000 ||
+        output_stream_params->rate > 768000 ||
         output_stream_params->channels < 1 ||
         output_stream_params->channels > UINT8_MAX) {
       return CUBEB_ERROR_INVALID_FORMAT;
@@ -75,7 +75,7 @@ validate_stream_params(cubeb_stream_params * input_stream_params,
   }
   if (input_stream_params) {
     if (input_stream_params->rate < 1000 ||
-        input_stream_params->rate > 192000 ||
+        input_stream_params->rate > 768000 ||
         input_stream_params->channels < 1 ||
         input_stream_params->channels > UINT8_MAX) {
       return CUBEB_ERROR_INVALID_FORMAT;
@@ -214,12 +214,25 @@ cubeb_init(cubeb ** context, char const * context_name,
   return CUBEB_ERROR;
 }
 
-const char**
+char const *
+cubeb_get_backend_id(cubeb * context)
+{
+  if (!context) {
+    return NULL;
+  }
+
+  return context->ops->get_backend_id(context);
+}
+
+cubeb_backend_names
 cubeb_get_backend_names()
 {
-  static const char* backend_names[] = {
+  static const char * const backend_names[] = {
 #if defined(USE_PULSE)
     "pulse",
+#endif
+#if defined(USE_PULSE_RUST)
+    "pulse-rust",
 #endif
 #if defined(USE_JACK)
     "jack",
@@ -229,6 +242,9 @@ cubeb_get_backend_names()
 #endif
 #if defined(USE_AUDIOUNIT)
     "audiounit",
+#endif
+#if defined(USE_AUDIOUNIT_RUST)
+    "audiounit-rust",
 #endif
 #if defined(USE_WASAPI)
     "wasapi",
@@ -242,23 +258,27 @@ cubeb_get_backend_names()
 #if defined(USE_SUN)
     "sun",
 #endif
+#if defined(USE_OPENSL)
+    "opensl",
+#endif
 #if defined(USE_OSS)
     "oss",
 #endif
-    NULL,
+#if defined(USE_AAUDIO)
+    "aaudio",
+#endif
+#if defined(USE_AUDIOTRACK)
+    "audiotrack",
+#endif
+#if defined(USE_KAI)
+    "kai",
+#endif
   };
 
-  return backend_names;
-}
-
-char const *
-cubeb_get_backend_id(cubeb * context)
-{
-  if (!context) {
-    return NULL;
-  }
-
-  return context->ops->get_backend_id(context);
+  return (cubeb_backend_names){
+      .names = backend_names,
+      .count = NELEMS(backend_names),
+  };
 }
 
 int
@@ -302,6 +322,21 @@ cubeb_get_preferred_sample_rate(cubeb * context, uint32_t * rate)
   }
 
   return context->ops->get_preferred_sample_rate(context, rate);
+}
+
+int
+cubeb_get_supported_input_processing_params(
+    cubeb * context, cubeb_input_processing_params * params)
+{
+  if (!context || !params) {
+    return CUBEB_ERROR_INVALID_PARAMETER;
+  }
+
+  if (!context->ops->get_supported_input_processing_params) {
+    return CUBEB_ERROR_NOT_SUPPORTED;
+  }
+
+  return context->ops->get_supported_input_processing_params(context, params);
 }
 
 void
@@ -461,6 +496,36 @@ cubeb_stream_get_current_device(cubeb_stream * stream,
   }
 
   return stream->context->ops->stream_get_current_device(stream, device);
+}
+
+int
+cubeb_stream_set_input_mute(cubeb_stream * stream, int mute)
+{
+  if (!stream) {
+    return CUBEB_ERROR_INVALID_PARAMETER;
+  }
+
+  if (!stream->context->ops->stream_set_input_mute) {
+    return CUBEB_ERROR_NOT_SUPPORTED;
+  }
+
+  return stream->context->ops->stream_set_input_mute(stream, mute);
+}
+
+int
+cubeb_stream_set_input_processing_params(cubeb_stream * stream,
+                                         cubeb_input_processing_params params)
+{
+  if (!stream) {
+    return CUBEB_ERROR_INVALID_PARAMETER;
+  }
+
+  if (!stream->context->ops->stream_set_input_processing_params) {
+    return CUBEB_ERROR_NOT_SUPPORTED;
+  }
+
+  return stream->context->ops->stream_set_input_processing_params(stream,
+                                                                  params);
 }
 
 int

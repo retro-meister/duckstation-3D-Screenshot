@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2023 Connor McLaughlin <stenzek@gmail.com>, PCSX2 Team
-// SPDX-License-Identifier: GPL-3.0
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 
@@ -8,7 +8,7 @@
 class PerfScope
 {
 public:
-  constexpr PerfScope(const char* prefix) : m_prefix(prefix) {}
+  constexpr explicit PerfScope(const char* prefix) : m_prefix(prefix) {}
   bool HasPrefix() const { return (m_prefix && m_prefix[0]); }
 
   void Register(const void* ptr, size_t size, const char* symbol);

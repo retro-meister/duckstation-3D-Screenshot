@@ -1,18 +1,19 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "d3d11_pipeline.h"
 #include "d3d11_device.h"
+#include "d3d11_texture.h"
 #include "d3d_common.h"
 
-#include "common/log.h"
+#include "common/assert.h"
+#include "common/error.h"
+#include "common/hash_combine.h"
 
 #include "fmt/format.h"
 
 #include <array>
 #include <malloc.h>
-
-Log_SetChannel(D3D11Device);
 
 D3D11Shader::D3D11Shader(GPUShaderStage stage, Microsoft::WRL::ComPtr<ID3D11DeviceChild> shader,
                          std::vector<u8> bytecode)
@@ -46,12 +47,17 @@ ID3D11ComputeShader* D3D11Shader::GetComputeShader() const
   return static_cast<ID3D11ComputeShader*>(m_shader.Get());
 }
 
-void D3D11Shader::SetDebugName(const std::string_view& name)
+#ifdef ENABLE_GPU_OBJECT_NAMES
+
+void D3D11Shader::SetDebugName(std::string_view name)
 {
   SetD3DDebugObjectName(m_shader.Get(), name);
 }
 
-std::unique_ptr<GPUShader> D3D11Device::CreateShaderFromBinary(GPUShaderStage stage, std::span<const u8> data)
+#endif
+
+std::unique_ptr<GPUShader> D3D11Device::CreateShaderFromBinary(GPUShaderStage stage, std::span<const u8> data,
+                                                               Error* error)
 {
   ComPtr<ID3D11DeviceChild> shader;
   std::vector<u8> bytecode;
@@ -87,21 +93,31 @@ std::unique_ptr<GPUShader> D3D11Device::CreateShaderFromBinary(GPUShaderStage st
   }
 
   if (FAILED(hr) || !shader)
+  {
+    Error::SetHResult(error, "Create[Typed]Shader() failed: ", hr);
     return {};
+  }
 
   return std::unique_ptr<GPUShader>(new D3D11Shader(stage, std::move(shader), std::move(bytecode)));
 }
 
-std::unique_ptr<GPUShader> D3D11Device::CreateShaderFromSource(GPUShaderStage stage, const std::string_view& source,
-                                                               const char* entry_point,
-                                                               DynamicHeapArray<u8>* out_binary)
+std::unique_ptr<GPUShader> D3D11Device::CreateShaderFromSource(GPUShaderStage stage, GPUShaderLanguage language,
+                                                               std::string_view source, const char* entry_point,
+                                                               DynamicHeapArray<u8>* out_binary, Error* error)
 {
+  const u32 shader_model = D3DCommon::GetShaderModelForFeatureLevelNumber(m_render_api_version);
+  if (language != GPUShaderLanguage::HLSL)
+  {
+    return TranspileAndCreateShaderFromSource(stage, language, source, entry_point, GPUShaderLanguage::HLSL,
+                                              shader_model, out_binary, error);
+  }
+
   std::optional<DynamicHeapArray<u8>> bytecode =
-    D3DCommon::CompileShader(m_device->GetFeatureLevel(), m_debug_device, stage, source, entry_point);
+    D3DCommon::CompileShader(shader_model, m_debug_device, stage, source, entry_point, error);
   if (!bytecode.has_value())
     return {};
 
-  std::unique_ptr<GPUShader> ret = CreateShaderFromBinary(stage, bytecode.value());
+  std::unique_ptr<GPUShader> ret = CreateShaderFromBinary(stage, bytecode.value(), error);
   if (ret && out_binary)
     *out_binary = std::move(bytecode.value());
 
@@ -110,10 +126,10 @@ std::unique_ptr<GPUShader> D3D11Device::CreateShaderFromSource(GPUShaderStage st
 
 D3D11Pipeline::D3D11Pipeline(ComPtr<ID3D11RasterizerState> rs, ComPtr<ID3D11DepthStencilState> ds,
                              ComPtr<ID3D11BlendState> bs, ComPtr<ID3D11InputLayout> il, ComPtr<ID3D11VertexShader> vs,
-                             ComPtr<ID3D11GeometryShader> gs, ComPtr<ID3D11PixelShader> ps,
+                             ComPtr<ID3D11GeometryShader> gs, ComPtr<ID3D11DeviceChild> ps_or_cs,
                              D3D11_PRIMITIVE_TOPOLOGY topology, u32 vertex_stride, u32 blend_factor)
   : m_rs(std::move(rs)), m_ds(std::move(ds)), m_bs(std::move(bs)), m_il(std::move(il)), m_vs(std::move(vs)),
-    m_gs(std::move(gs)), m_ps(std::move(ps)), m_topology(topology), m_vertex_stride(vertex_stride),
+    m_gs(std::move(gs)), m_ps_or_cs(std::move(ps_or_cs)), m_topology(topology), m_vertex_stride(vertex_stride),
     m_blend_factor(blend_factor), m_blend_factor_float(GPUDevice::RGBA8ToFloat(blend_factor))
 {
 }
@@ -123,12 +139,17 @@ D3D11Pipeline::~D3D11Pipeline()
   D3D11Device::GetInstance().UnbindPipeline(this);
 }
 
-void D3D11Pipeline::SetDebugName(const std::string_view& name)
+#ifdef ENABLE_GPU_OBJECT_NAMES
+
+void D3D11Pipeline::SetDebugName(std::string_view name)
 {
   // can't label this directly
 }
 
-D3D11Device::ComPtr<ID3D11RasterizerState> D3D11Device::GetRasterizationState(const GPUPipeline::RasterizationState& rs)
+#endif
+
+D3D11Device::ComPtr<ID3D11RasterizerState> D3D11Device::GetRasterizationState(const GPUPipeline::RasterizationState& rs,
+                                                                              Error* error)
 {
   ComPtr<ID3D11RasterizerState> drs;
 
@@ -152,14 +173,15 @@ D3D11Device::ComPtr<ID3D11RasterizerState> D3D11Device::GetRasterizationState(co
   // desc.MultisampleEnable ???
 
   HRESULT hr = m_device->CreateRasterizerState(&desc, drs.GetAddressOf());
-  if (FAILED(hr))
-    Log_ErrorPrintf("Failed to create depth state with %08X", hr);
+  if (FAILED(hr)) [[unlikely]]
+    Error::SetHResult(error, "CreateRasterizerState() failed: ", hr);
+  else
+    m_rasterization_states.emplace(rs.key, drs);
 
-  m_rasterization_states.emplace(rs.key, drs);
   return drs;
 }
 
-D3D11Device::ComPtr<ID3D11DepthStencilState> D3D11Device::GetDepthState(const GPUPipeline::DepthState& ds)
+D3D11Device::ComPtr<ID3D11DepthStencilState> D3D11Device::GetDepthState(const GPUPipeline::DepthState& ds, Error* error)
 {
   ComPtr<ID3D11DepthStencilState> dds;
 
@@ -187,18 +209,28 @@ D3D11Device::ComPtr<ID3D11DepthStencilState> D3D11Device::GetDepthState(const GP
   desc.DepthWriteMask = ds.depth_write ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
 
   HRESULT hr = m_device->CreateDepthStencilState(&desc, dds.GetAddressOf());
-  if (FAILED(hr))
-    Log_ErrorPrintf("Failed to create depth state with %08X", hr);
+  if (FAILED(hr)) [[unlikely]]
+    Error::SetHResult(error, "CreateDepthStencilState() failed: ", hr);
+  else
+    m_depth_states.emplace(ds.key, dds);
 
-  m_depth_states.emplace(ds.key, dds);
   return dds;
 }
 
-D3D11Device::ComPtr<ID3D11BlendState> D3D11Device::GetBlendState(const GPUPipeline::BlendState& bs)
+size_t D3D11Device::BlendStateMapHash::operator()(const BlendStateMapKey& key) const
+{
+  size_t h = std::hash<u64>()(key.first);
+  hash_combine(h, key.second);
+  return h;
+}
+
+D3D11Device::ComPtr<ID3D11BlendState> D3D11Device::GetBlendState(const GPUPipeline::BlendState& bs, u32 num_rts,
+                                                                 Error* error)
 {
   ComPtr<ID3D11BlendState> dbs;
 
-  const auto it = m_blend_states.find(bs.key);
+  const std::pair<u64, u32> key(bs.key, num_rts);
+  const auto it = m_blend_states.find(key);
   if (it != m_blend_states.end())
   {
     dbs = it->second;
@@ -231,29 +263,33 @@ D3D11Device::ComPtr<ID3D11BlendState> D3D11Device::GetBlendState(const GPUPipeli
   }};
 
   D3D11_BLEND_DESC blend_desc = {};
-  D3D11_RENDER_TARGET_BLEND_DESC& tgt_desc = blend_desc.RenderTarget[0];
-  tgt_desc.BlendEnable = bs.enable;
-  tgt_desc.RenderTargetWriteMask = bs.write_mask;
-  if (bs.enable)
+  for (u32 i = 0; i < num_rts; i++)
   {
-    tgt_desc.SrcBlend = blend_mapping[static_cast<u8>(bs.src_blend.GetValue())];
-    tgt_desc.DestBlend = blend_mapping[static_cast<u8>(bs.dst_blend.GetValue())];
-    tgt_desc.BlendOp = op_mapping[static_cast<u8>(bs.blend_op.GetValue())];
-    tgt_desc.SrcBlendAlpha = blend_mapping[static_cast<u8>(bs.src_alpha_blend.GetValue())];
-    tgt_desc.DestBlendAlpha = blend_mapping[static_cast<u8>(bs.dst_alpha_blend.GetValue())];
-    tgt_desc.BlendOpAlpha = op_mapping[static_cast<u8>(bs.alpha_blend_op.GetValue())];
+    D3D11_RENDER_TARGET_BLEND_DESC& tgt_desc = blend_desc.RenderTarget[i];
+    tgt_desc.BlendEnable = bs.enable;
+    tgt_desc.RenderTargetWriteMask = bs.write_mask;
+    if (bs.enable)
+    {
+      tgt_desc.SrcBlend = blend_mapping[static_cast<u8>(bs.src_blend.GetValue())];
+      tgt_desc.DestBlend = blend_mapping[static_cast<u8>(bs.dst_blend.GetValue())];
+      tgt_desc.BlendOp = op_mapping[static_cast<u8>(bs.blend_op.GetValue())];
+      tgt_desc.SrcBlendAlpha = blend_mapping[static_cast<u8>(bs.src_alpha_blend.GetValue())];
+      tgt_desc.DestBlendAlpha = blend_mapping[static_cast<u8>(bs.dst_alpha_blend.GetValue())];
+      tgt_desc.BlendOpAlpha = op_mapping[static_cast<u8>(bs.alpha_blend_op.GetValue())];
+    }
   }
 
   HRESULT hr = m_device->CreateBlendState(&blend_desc, dbs.GetAddressOf());
-  if (FAILED(hr))
-    Log_ErrorPrintf("Failed to create blend state with %08X", hr);
+  if (FAILED(hr)) [[unlikely]]
+    Error::SetHResult(error, "CreateBlendState() failed: ", hr);
+  else
+    m_blend_states.emplace(key, dbs);
 
-  m_blend_states.emplace(bs.key, dbs);
   return dbs;
 }
 
 D3D11Device::ComPtr<ID3D11InputLayout> D3D11Device::GetInputLayout(const GPUPipeline::InputLayout& il,
-                                                                   const D3D11Shader* vs)
+                                                                   const D3D11Shader* vs, Error* error)
 {
   ComPtr<ID3D11InputLayout> dil;
   const auto it = m_input_layouts.find(il);
@@ -297,18 +333,19 @@ D3D11Device::ComPtr<ID3D11InputLayout> D3D11Device::GetInputLayout(const GPUPipe
 
   HRESULT hr = m_device->CreateInputLayout(elems, static_cast<UINT>(il.vertex_attributes.size()),
                                            vs->GetBytecode().data(), vs->GetBytecode().size(), dil.GetAddressOf());
-  if (FAILED(hr))
-    Log_ErrorPrintf("Failed to create input layout with %08X", hr);
+  if (FAILED(hr)) [[unlikely]]
+    Error::SetHResult(error, "CreateInputLayout() failed: ", hr);
+  else
+    m_input_layouts.emplace(il, dil);
 
-  m_input_layouts.emplace(il, dil);
   return dil;
 }
 
-std::unique_ptr<GPUPipeline> D3D11Device::CreatePipeline(const GPUPipeline::GraphicsConfig& config)
+std::unique_ptr<GPUPipeline> D3D11Device::CreatePipeline(const GPUPipeline::GraphicsConfig& config, Error* error)
 {
-  ComPtr<ID3D11RasterizerState> rs = GetRasterizationState(config.rasterization);
-  ComPtr<ID3D11DepthStencilState> ds = GetDepthState(config.depth);
-  ComPtr<ID3D11BlendState> bs = GetBlendState(config.blend);
+  ComPtr<ID3D11RasterizerState> rs = GetRasterizationState(config.rasterization, error);
+  ComPtr<ID3D11DepthStencilState> ds = GetDepthState(config.depth, error);
+  ComPtr<ID3D11BlendState> bs = GetBlendState(config.blend, config.GetRenderTargetCount(), error);
   if (!rs || !ds || !bs)
     return {};
 
@@ -316,7 +353,7 @@ std::unique_ptr<GPUPipeline> D3D11Device::CreatePipeline(const GPUPipeline::Grap
   u32 vertex_stride = 0;
   if (!config.input_layout.vertex_attributes.empty())
   {
-    il = GetInputLayout(config.input_layout, static_cast<const D3D11Shader*>(config.vertex_shader));
+    il = GetInputLayout(config.input_layout, static_cast<const D3D11Shader*>(config.vertex_shader), error);
     vertex_stride = config.input_layout.vertex_stride;
     if (!il)
       return {};
@@ -338,69 +375,124 @@ std::unique_ptr<GPUPipeline> D3D11Device::CreatePipeline(const GPUPipeline::Grap
     primitives[static_cast<u8>(config.primitive)], vertex_stride, config.blend.constant));
 }
 
+std::unique_ptr<GPUPipeline> D3D11Device::CreatePipeline(const GPUPipeline::ComputeConfig& config, Error* error)
+{
+  if (!config.compute_shader) [[unlikely]]
+  {
+    Error::SetStringView(error, "Missing compute shader.");
+    return {};
+  }
+
+  return std::unique_ptr<GPUPipeline>(
+    new D3D11Pipeline(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                      static_cast<const D3D11Shader*>(config.compute_shader)->GetComputeShader(),
+                      D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED, 0, 0));
+}
+
 void D3D11Device::SetPipeline(GPUPipeline* pipeline)
 {
   if (m_current_pipeline == pipeline)
     return;
 
+  const bool was_compute = m_current_pipeline && m_current_pipeline->IsComputePipeline();
   D3D11Pipeline* const PL = static_cast<D3D11Pipeline*>(pipeline);
   m_current_pipeline = PL;
 
-  if (ID3D11InputLayout* il = PL->GetInputLayout(); m_current_input_layout != il)
+  if (!PL->IsComputePipeline())
   {
-    m_current_input_layout = il;
-    m_context->IASetInputLayout(il);
-  }
+    if (was_compute)
+      UnbindComputePipeline();
 
-  if (const u32 vertex_stride = PL->GetVertexStride(); m_current_vertex_stride != vertex_stride)
-  {
-    const UINT offset = 0;
-    m_current_vertex_stride = PL->GetVertexStride();
-    m_context->IASetVertexBuffers(0, 1, m_vertex_buffer.GetD3DBufferArray(), &m_current_vertex_stride, &offset);
-  }
+    if (ID3D11InputLayout* il = PL->GetInputLayout(); m_current_input_layout != il)
+    {
+      m_current_input_layout = il;
+      m_context->IASetInputLayout(il);
+    }
 
-  if (D3D_PRIMITIVE_TOPOLOGY topology = PL->GetPrimitiveTopology(); m_current_primitive_topology != topology)
-  {
-    m_current_primitive_topology = topology;
-    m_context->IASetPrimitiveTopology(topology);
-  }
+    if (const u32 vertex_stride = PL->GetVertexStride(); m_current_vertex_stride != vertex_stride)
+    {
+      const UINT offset = 0;
+      m_current_vertex_stride = PL->GetVertexStride();
+      m_context->IASetVertexBuffers(0, 1, m_vertex_buffer.GetD3DBufferArray(), &m_current_vertex_stride, &offset);
+    }
 
-  if (ID3D11VertexShader* vs = PL->GetVertexShader(); m_current_vertex_shader != vs)
-  {
-    m_current_vertex_shader = vs;
-    m_context->VSSetShader(vs, nullptr, 0);
-  }
+    if (D3D_PRIMITIVE_TOPOLOGY topology = PL->GetPrimitiveTopology(); m_current_primitive_topology != topology)
+    {
+      m_current_primitive_topology = topology;
+      m_context->IASetPrimitiveTopology(topology);
+    }
 
-  if (ID3D11GeometryShader* gs = PL->GetGeometryShader(); m_current_geometry_shader != gs)
-  {
-    m_current_geometry_shader = gs;
-    m_context->GSSetShader(gs, nullptr, 0);
-  }
+    if (ID3D11VertexShader* vs = PL->GetVertexShader(); m_current_vertex_shader != vs)
+    {
+      m_current_vertex_shader = vs;
+      m_context->VSSetShader(vs, nullptr, 0);
+    }
 
-  if (ID3D11PixelShader* ps = PL->GetPixelShader(); m_current_pixel_shader != ps)
-  {
-    m_current_pixel_shader = ps;
-    m_context->PSSetShader(ps, nullptr, 0);
-  }
+    if (ID3D11GeometryShader* gs = PL->GetGeometryShader(); m_current_geometry_shader != gs)
+    {
+      m_current_geometry_shader = gs;
+      m_context->GSSetShader(gs, nullptr, 0);
+    }
 
-  if (ID3D11RasterizerState* rs = PL->GetRasterizerState(); m_current_rasterizer_state != rs)
-  {
-    m_current_rasterizer_state = rs;
-    m_context->RSSetState(rs);
-  }
+    if (ID3D11PixelShader* ps = PL->GetPixelShader(); m_current_pixel_shader != ps)
+    {
+      m_current_pixel_shader = ps;
+      m_context->PSSetShader(ps, nullptr, 0);
+    }
 
-  if (ID3D11DepthStencilState* ds = PL->GetDepthStencilState(); m_current_depth_state != ds)
-  {
-    m_current_depth_state = ds;
-    m_context->OMSetDepthStencilState(ds, 0);
-  }
+    if (ID3D11RasterizerState* rs = PL->GetRasterizerState(); m_current_rasterizer_state != rs)
+    {
+      m_current_rasterizer_state = rs;
+      m_context->RSSetState(rs);
+    }
 
-  if (ID3D11BlendState* bs = PL->GetBlendState();
-      m_current_blend_state != bs || m_current_blend_factor != PL->GetBlendFactor())
+    if (ID3D11DepthStencilState* ds = PL->GetDepthStencilState(); m_current_depth_state != ds)
+    {
+      m_current_depth_state = ds;
+      m_context->OMSetDepthStencilState(ds, 0);
+    }
+
+    if (ID3D11BlendState* bs = PL->GetBlendState();
+        m_current_blend_state != bs || m_current_blend_factor != PL->GetBlendFactor())
+    {
+      m_current_blend_state = bs;
+      m_current_blend_factor = PL->GetBlendFactor();
+      m_context->OMSetBlendState(bs, RGBA8ToFloat(m_current_blend_factor).data(), 0xFFFFFFFFu);
+    }
+  }
+  else
   {
-    m_current_blend_state = bs;
-    m_current_blend_factor = PL->GetBlendFactor();
-    m_context->OMSetBlendState(bs, RGBA8ToFloat(m_current_blend_factor).data(), 0xFFFFFFFFu);
+    if (ID3D11ComputeShader* cs = m_current_pipeline->GetComputeShader(); cs != m_current_compute_shader)
+    {
+      m_current_compute_shader = cs;
+      m_context->CSSetShader(cs, nullptr, 0);
+    }
+
+    if (!was_compute)
+    {
+      // need to bind all SRVs/samplers
+      u32 count;
+      for (count = 0; count < MAX_TEXTURE_SAMPLERS; count++)
+      {
+        if (!m_current_textures[count])
+          break;
+      }
+      if (count > 0)
+      {
+        m_context->CSSetShaderResources(0, count, m_current_textures.data());
+        m_context->CSSetSamplers(0, count, m_current_samplers.data());
+      }
+
+      if (m_current_render_pass_flags & GPUPipeline::BindRenderTargetsAsImages)
+      {
+        ID3D11UnorderedAccessView* uavs[MAX_TEXTURE_SAMPLERS];
+        for (u32 i = 0; i < m_num_current_render_targets; i++)
+          uavs[i] = m_current_render_targets[i]->GetD3DUAV();
+
+        m_context->OMSetRenderTargets(0, nullptr, nullptr);
+        m_context->CSSetUnorderedAccessViews(0, m_num_current_render_targets, uavs, nullptr);
+      }
+    }
   }
 }
 
@@ -409,6 +501,23 @@ void D3D11Device::UnbindPipeline(D3D11Pipeline* pl)
   if (m_current_pipeline != pl)
     return;
 
+  if (pl->IsComputePipeline())
+    UnbindComputePipeline();
+
   // Let the runtime deal with the dead objects...
   m_current_pipeline = nullptr;
+}
+
+void D3D11Device::UnbindComputePipeline()
+{
+  m_current_compute_shader = nullptr;
+
+  ID3D11ShaderResourceView* null_srvs[MAX_TEXTURE_SAMPLERS] = {};
+  ID3D11SamplerState* null_samplers[MAX_TEXTURE_SAMPLERS] = {};
+  ID3D11UnorderedAccessView* null_uavs[MAX_RENDER_TARGETS] = {};
+  m_context->CSSetShader(nullptr, nullptr, 0);
+  m_context->CSSetShaderResources(0, MAX_TEXTURE_SAMPLERS, null_srvs);
+  m_context->CSSetSamplers(0, MAX_TEXTURE_SAMPLERS, null_samplers);
+  if (m_current_render_pass_flags & GPUPipeline::BindRenderTargetsAsImages)
+    m_context->CSSetUnorderedAccessViews(0, m_num_current_render_targets, null_uavs, nullptr);
 }

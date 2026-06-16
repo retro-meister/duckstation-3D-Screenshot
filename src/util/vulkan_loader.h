@@ -1,101 +1,68 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 
-#define VK_NO_PROTOTYPES
+#include "gpu_device.h"
+#include "vulkan_headers.h"
+#include "window_info.h"
 
-#ifdef _WIN32
-#define VK_USE_PLATFORM_WIN32_KHR
+#include "common/types.h"
 
-// vulkan.h pulls in windows.h on Windows, so we need to include our replacement header first
-#include "common/windows_headers.h"
-#elif defined(__APPLE__)
-#define VK_USE_PLATFORM_METAL_EXT
-#elif defined(__ANDROID__)
-#define VK_USE_PLATFORM_ANDROID_KHR
-#else
-#ifdef ENABLE_X11
-#define VK_USE_PLATFORM_XLIB_KHR
-#endif
+#include <optional>
+#include <utility>
+#include <vector>
 
-#ifdef ENABLE_WAYLAND
-#define VK_USE_PLATFORM_WAYLAND_KHR
-#endif
-#endif
+namespace VulkanLoader {
 
-#include "vulkan/vulkan.h"
+/// @brief List of Vulkan-compatible GPUs and associated adapter information.
+using GPUList = std::vector<std::pair<VkPhysicalDevice, GPUDevice::AdapterInfo>>;
 
-#if defined(ENABLE_X11)
+/// @brief Optional extensions for an instance.
+struct OptionalExtensions
+{
+  bool vk_khr_get_surface_capabilities2 : 1;
+  bool vk_khr_get_physical_device_properties2 : 1;
+  bool vk_khr_surface_maintenance1 : 1;
+};
 
-// This breaks a bunch of our code. They shouldn't be #defines in the first place.
-#ifdef None
-#undef None
-#endif
-#ifdef Always
-#undef Always
-#endif
-#ifdef Status
-#undef Status
-#endif
-#ifdef CursorShape
-#undef CursorShape
-#endif
-#ifdef KeyPress
-#undef KeyPress
-#endif
-#ifdef KeyRelease
-#undef KeyRelease
-#endif
-#ifdef FocusIn
-#undef FocusIn
-#endif
-#ifdef FocusOut
-#undef FocusOut
-#endif
-#ifdef FontChange
-#undef FontChange
-#endif
-#ifdef Expose
-#undef Expose
-#endif
-#ifdef Unsorted
-#undef Unsorted
-#endif
-#ifdef Bool
-#undef Bool
-#endif
+/// Creates the shared Vulkan instance. If debug_instance is changed, the instance will be recreated.
+/// @param window_type Window type for selecting required extensions.
+/// @param request_debug_instance Set to true if a debug instance is requested. May be modified to reflect actual state.
+/// @param error Error information if the instance could not be created.
+/// @return The Vulkan instance, or VK_NULL_HANDLE on failure.
+bool CreateVulkanInstance(WindowInfoType window_type, bool* request_debug_instance, Error* error);
 
-#endif
+/// Returns the shared Vulkan instance.
+VkInstance GetVulkanInstance();
 
-#include "vulkan_entry_points.h"
+/// Releases the shared Vulkan instance.
+void ReleaseVulkanInstance();
 
-// We include vk_mem_alloc globally, so we don't accidentally include it before the vulkan header somewhere.
-#ifdef __clang__
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wnullability-completeness"
-#pragma clang diagnostic ignored "-Wunused-variable"
-#pragma clang diagnostic ignored "-Wmissing-field-initializers"
-#elif defined(_MSC_VER)
-#pragma warning(push, 0)
-#endif
+/// Destroys the instance, if any, and unloads the Vulkan library.
+void DestroyVulkanInstance();
 
-#define VMA_STATIC_VULKAN_FUNCTIONS 1
-#define VMA_DYNAMIC_VULKAN_FUNCTIONS 0
-#define VMA_STATS_STRING_ENABLED 0
-#include "vulkan/vk_mem_alloc.h"
+/// Returns optional extensions for the current instance.
+const OptionalExtensions& GetOptionalExtensions();
 
-#ifdef __clang__
-#pragma clang diagnostic pop
-#elif defined(_MSC_VER)
-#pragma warning(pop)
-#endif
+/// Enumerates Vulkan devices.
+GPUList EnumerateGPUs(Error* error);
 
-namespace Vulkan {
-bool IsVulkanLibraryLoaded();
-bool LoadVulkanLibrary();
-bool LoadVulkanInstanceFunctions(VkInstance instance);
-bool LoadVulkanDeviceFunctions(VkDevice device);
-void UnloadVulkanLibrary();
-void ResetVulkanLibraryFunctionPointers();
-} // namespace Vulkan
+/// Safely creates the instance and returns a list of adapters and associated information.
+std::optional<GPUDevice::AdapterInfoList> GetAdapterList(WindowInfoType window_type, Error* error);
+
+/// Returns true if Vulkan is suitable as a default for the devices in the system.
+bool IsSuitableDefaultRenderer(WindowInfoType window_type);
+
+/// Loads Vulkan device-level functions for the given device.
+/// @param device The Vulkan device to load functions for.
+bool LoadDeviceFunctions(VkDevice device, Error* error);
+
+/// Releases Vulkan device-level functions.
+void ResetDeviceFunctions();
+
+/// @brief Guesses the GPU driver type based on device and driver properties.
+GPUDriverType GuessDriverType(const VkPhysicalDeviceProperties& device_properties,
+                              const VkPhysicalDeviceDriverProperties& driver_properties);
+
+} // namespace VulkanLoader

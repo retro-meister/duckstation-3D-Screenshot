@@ -1,15 +1,17 @@
-# _scmversion.cpp is a dummy file that will never be created, so the command will always be run
-if(CMAKE_HOST_SYSTEM MATCHES "Windows")
-  add_custom_command(OUTPUT scmversion.cpp _scmversion.cpp
-                     COMMAND cmd /k "${CMAKE_CURRENT_SOURCE_DIR}/gen_scmversion.bat"
-                     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
-else()
-  add_custom_command(OUTPUT scmversion.cpp PRE_BUILD
-                     COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/gen_scmversion.sh")
-endif()
+# SPDX-FileCopyrightText: 2019-2026 Connor McLaughlin <stenzek@gmail.com>
+# SPDX-License-Identifier: CC-BY-NC-ND-4.0 + Packaging Restriction
+#
+# NOTE: In addition to the terms of CC-BY-NC-ND-4.0, you may not use this file to create
+# packages or build recipes without explicit permission from the copyright holder.
+
+add_custom_target(generate_scmversion
+                  COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/gen_scmversion.sh"
+                  WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+                  BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/scmversion.cpp"
+                  COMMENT "Checking if scmversion.cpp needs to be updated")
 
 add_library(scmversion
-  scmversion.cpp
+  "${CMAKE_CURRENT_BINARY_DIR}/scmversion.cpp"
   scmversion.h
 )
-
+add_dependencies(scmversion generate_scmversion)

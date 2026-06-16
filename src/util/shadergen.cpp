@@ -1,51 +1,96 @@
-// SPDX-FileCopyrightText: 2019-2023 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2025 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #include "shadergen.h"
+
 #include "common/assert.h"
 #include "common/bitutils.h"
 #include "common/log.h"
+
 #include <cstdio>
 #include <cstring>
+#include <iomanip>
 
 #ifdef ENABLE_OPENGL
 #include "opengl_loader.h"
 #endif
 
-Log_SetChannel(ShaderGen);
+LOG_CHANNEL(ShaderGen);
 
-ShaderGen::ShaderGen(RenderAPI render_api, bool supports_dual_source_blend, bool supports_framebuffer_fetch)
-  : m_render_api(render_api), m_glsl(render_api != RenderAPI::D3D11 && render_api != RenderAPI::D3D12),
-    m_spirv(render_api == RenderAPI::Vulkan || render_api == RenderAPI::Metal),
-    m_supports_dual_source_blend(supports_dual_source_blend), m_supports_framebuffer_fetch(supports_framebuffer_fetch),
-    m_use_glsl_interface_blocks(false)
+ShaderGen::ShaderGen(RenderAPI render_api, GPUShaderLanguage shader_language, bool supports_dual_source_blend,
+                     bool supports_framebuffer_fetch)
+  : m_render_api(render_api), m_shader_language(shader_language),
+    m_glsl(shader_language == GPUShaderLanguage::GLSL || shader_language == GPUShaderLanguage::GLSLES ||
+           shader_language == GPUShaderLanguage::GLSLVK),
+    m_spirv(shader_language == GPUShaderLanguage::GLSLVK), m_supports_dual_source_blend(supports_dual_source_blend),
+    m_supports_framebuffer_fetch(supports_framebuffer_fetch)
 {
-#if defined(ENABLE_OPENGL) || defined(ENABLE_VULKAN) || defined(__APPLE__)
   if (m_glsl)
   {
 #ifdef ENABLE_OPENGL
     if (m_render_api == RenderAPI::OpenGL || m_render_api == RenderAPI::OpenGLES)
-      SetGLSLVersionString();
+    {
+      m_glsl_version = GetGLSLVersion(render_api);
+      m_glsl_version_string = GetGLSLVersionString(m_render_api, m_glsl_version);
+      m_use_glsl_interface_blocks = UseGLSLInterfaceBlocks();
+      m_use_glsl_binding_layout = UseGLSLBindingLayout();
+    }
+    else
+    {
+      m_use_glsl_interface_blocks = (shader_language == GPUShaderLanguage::GLSLVK);
+      m_use_glsl_binding_layout = (shader_language == GPUShaderLanguage::GLSLVK);
+    }
 
-    m_use_glsl_interface_blocks = (IsVulkan() || IsMetal() || GLAD_GL_ES_VERSION_3_2 || GLAD_GL_VERSION_3_2);
-    m_use_glsl_binding_layout = (IsVulkan() || IsMetal() || UseGLSLBindingLayout());
-
-    if (m_render_api == RenderAPI::OpenGL)
+#ifdef _WIN32
+    if (m_shader_language == GPUShaderLanguage::GLSL)
     {
       // SSAA with interface blocks is broken on AMD's OpenGL driver.
       const char* gl_vendor = reinterpret_cast<const char*>(glGetString(GL_VENDOR));
       if (std::strcmp(gl_vendor, "ATI Technologies Inc.") == 0)
         m_use_glsl_interface_blocks = false;
     }
+#endif
 #else
     m_use_glsl_interface_blocks = true;
     m_use_glsl_binding_layout = true;
 #endif
   }
-#endif
 }
 
 ShaderGen::~ShaderGen() = default;
+
+GPUShaderLanguage ShaderGen::GetShaderLanguageForAPI(RenderAPI api)
+{
+  switch (api)
+  {
+    case RenderAPI::D3D11:
+    case RenderAPI::D3D12:
+      return GPUShaderLanguage::HLSL;
+
+    case RenderAPI::Vulkan:
+    case RenderAPI::Metal:
+      return GPUShaderLanguage::GLSLVK;
+
+    case RenderAPI::OpenGL:
+      return GPUShaderLanguage::GLSL;
+
+    case RenderAPI::OpenGLES:
+      return GPUShaderLanguage::GLSLES;
+
+    case RenderAPI::None:
+    default:
+      return GPUShaderLanguage::None;
+  }
+}
+
+bool ShaderGen::UseGLSLInterfaceBlocks()
+{
+#ifdef ENABLE_OPENGL
+  return (GLAD_GL_ES_VERSION_3_2 || GLAD_GL_VERSION_3_2);
+#else
+  return true;
+#endif
+}
 
 bool ShaderGen::UseGLSLBindingLayout()
 {
@@ -58,21 +103,21 @@ bool ShaderGen::UseGLSLBindingLayout()
 #endif
 }
 
-void ShaderGen::DefineMacro(std::stringstream& ss, const char* name, bool enabled)
+void ShaderGen::DefineMacro(std::stringstream& ss, const char* name, bool enabled) const
 {
   ss << "#define " << name << " " << BoolToUInt32(enabled) << "\n";
 }
 
-void ShaderGen::DefineMacro(std::stringstream& ss, const char* name, s32 value)
+void ShaderGen::DefineMacro(std::stringstream& ss, const char* name, s32 value) const
 {
   ss << "#define " << name << " " << value << "\n";
 }
 
-#ifdef ENABLE_OPENGL
-void ShaderGen::SetGLSLVersionString()
+u32 ShaderGen::GetGLSLVersion(RenderAPI render_api)
 {
+#ifdef ENABLE_OPENGL
   const char* glsl_version = reinterpret_cast<const char*>(glGetString(GL_SHADING_LANGUAGE_VERSION));
-  const bool glsl_es = (m_render_api == RenderAPI::OpenGLES);
+  const bool glsl_es = (render_api == RenderAPI::OpenGLES);
   Assert(glsl_version != nullptr);
 
   // Skip any strings in front of the version code.
@@ -97,32 +142,57 @@ void ShaderGen::SetGLSLVersionString()
   }
   else
   {
-    Log_ErrorPrintf("Invalid GLSL version string: '%s' ('%s')", glsl_version, glsl_version_start);
+    ERROR_LOG("Invalid GLSL version string: '{}' ('{}')", glsl_version, glsl_version_start);
     if (glsl_es)
     {
       major_version = 3;
       minor_version = 0;
     }
-    m_glsl_version_string = glsl_es ? "300" : "130";
   }
 
-  char buf[128];
-  std::snprintf(buf, sizeof(buf), "#version %d%02d%s", major_version, minor_version,
-                (glsl_es && major_version >= 3) ? " es" : "");
-  m_glsl_version_string = buf;
-}
+  return (static_cast<u32>(major_version) * 100) + static_cast<u32>(minor_version);
+#else
+  return 460;
 #endif
+}
 
-void ShaderGen::WriteHeader(std::stringstream& ss)
+TinyString ShaderGen::GetGLSLVersionString(RenderAPI render_api, u32 version)
 {
-  if (m_render_api == RenderAPI::OpenGL || m_render_api == RenderAPI::OpenGLES)
+  const bool glsl_es = (render_api == RenderAPI::OpenGLES);
+  const u32 major_version = (version / 100);
+  const u32 minor_version = (version % 100);
+
+  return TinyString::from_format("#version {}{:02d}{}", major_version, minor_version,
+                                 (glsl_es && major_version >= 3) ? " es" : "");
+}
+
+void ShaderGen::WriteHeader(std::stringstream& ss, bool enable_rov /* = false */,
+                            bool enable_framebuffer_fetch /* = false */,
+                            bool enable_dual_source_blend /* = false */) const
+{
+  DebugAssert((!enable_rov && !enable_framebuffer_fetch && !enable_dual_source_blend) ||
+              (enable_rov && !enable_framebuffer_fetch && !enable_dual_source_blend) ||
+              (enable_rov && !enable_framebuffer_fetch && !enable_dual_source_blend) ||
+              (!enable_rov && enable_framebuffer_fetch && !enable_dual_source_blend) ||
+              (!enable_rov && !enable_framebuffer_fetch && enable_dual_source_blend));
+  if (m_shader_language == GPUShaderLanguage::GLSL || m_shader_language == GPUShaderLanguage::GLSLES)
     ss << m_glsl_version_string << "\n\n";
   else if (m_spirv)
     ss << "#version 450 core\n\n";
 
+#ifdef __APPLE__
+  // TODO: Do this for Vulkan as well.
+  if (m_render_api == RenderAPI::Metal)
+  {
+    if (!m_supports_framebuffer_fetch)
+      ss << "#extension GL_EXT_samplerless_texture_functions : require\n";
+  }
+#endif
+
 #ifdef ENABLE_OPENGL
   // Extension enabling for OpenGL.
-  if (m_render_api == RenderAPI::OpenGL || m_render_api == RenderAPI::OpenGLES)
+  if (enable_framebuffer_fetch &&
+      (m_shader_language == GPUShaderLanguage::GLSL || m_shader_language == GPUShaderLanguage::GLSLES))
   {
     if (GLAD_GL_EXT_shader_framebuffer_fetch)
       ss << "#extension GL_EXT_shader_framebuffer_fetch : require\n";
@@ -130,26 +200,18 @@ void ShaderGen::WriteHeader(std::stringstream& ss)
       ss << "#extension GL_ARM_shader_framebuffer_fetch : require\n";
   }
 
-  if (m_render_api == RenderAPI::OpenGLES)
+  if (m_shader_language == GPUShaderLanguage::GLSLES)
   {
     // Enable EXT_blend_func_extended for dual-source blend on OpenGL ES.
-    if (GLAD_GL_EXT_blend_func_extended)
-      ss << "#extension GL_EXT_blend_func_extended : require\n";
-    if (GLAD_GL_ARB_blend_func_extended)
-      ss << "#extension GL_ARB_blend_func_extended : require\n";
-
-    // Test for V3D driver - we have to fudge coordinates slightly.
-    if (std::strstr(reinterpret_cast<const char*>(glGetString(GL_VENDOR)), "Broadcom") &&
-        std::strstr(reinterpret_cast<const char*>(glGetString(GL_RENDERER)), "V3D"))
+    if (enable_dual_source_blend)
     {
-      ss << "#define DRIVER_V3D 1\n";
-    }
-    else if (std::strstr(reinterpret_cast<const char*>(glGetString(GL_RENDERER)), "PowerVR"))
-    {
-      ss << "#define DRIVER_POWERVR 1\n";
+      if (GLAD_GL_EXT_blend_func_extended)
+        ss << "#extension GL_EXT_blend_func_extended : require\n";
+      if (GLAD_GL_ARB_blend_func_extended)
+        ss << "#extension GL_ARB_blend_func_extended : require\n";
     }
   }
-  else if (m_render_api == RenderAPI::OpenGL)
+  else if (m_shader_language == GPUShaderLanguage::GLSL)
   {
     // Need extensions for binding layout if GL<4.3.
     if (m_use_glsl_binding_layout && !GLAD_GL_VERSION_4_3)
@@ -166,6 +228,11 @@ void ShaderGen::WriteHeader(std::stringstream& ss)
     if (!GLAD_GL_VERSION_4_3 && !GLAD_GL_ES_VERSION_3_1 && GLAD_GL_ARB_shader_storage_buffer_object)
       ss << "#extension GL_ARB_shader_storage_buffer_object : require\n";
   }
+  else if (m_shader_language == GPUShaderLanguage::GLSLVK)
+  {
+    if (enable_rov)
+      ss << "#extension GL_ARB_fragment_shader_interlock : require\n";
+  }
 #endif
 
   DefineMacro(ss, "API_OPENGL", m_render_api == RenderAPI::OpenGL);
@@ -176,11 +243,13 @@ void ShaderGen::WriteHeader(std::stringstream& ss)
   DefineMacro(ss, "API_METAL", m_render_api == RenderAPI::Metal);
 
 #ifdef ENABLE_OPENGL
-  if (m_render_api == RenderAPI::OpenGLES)
+  if (m_shader_language == GPUShaderLanguage::GLSLES)
   {
     ss << "precision highp float;\n";
     ss << "precision highp int;\n";
     ss << "precision highp sampler2D;\n";
+    ss << "precision highp isampler2D;\n";
+    ss << "precision highp usampler2D;\n";
 
     if (GLAD_GL_ES_VERSION_3_1)
       ss << "precision highp sampler2DMS;\n";
@@ -204,6 +273,9 @@ void ShaderGen::WriteHeader(std::stringstream& ss)
     ss << "#define uint2 uvec2\n";
     ss << "#define uint3 uvec3\n";
     ss << "#define uint4 uvec4\n";
+    ss << "#define bool2 bvec2\n";
+    ss << "#define bool3 bvec3\n";
+    ss << "#define bool4 bvec4\n";
     ss << "#define float2x2 mat2\n";
     ss << "#define float3x3 mat3\n";
     ss << "#define float4x4 mat4\n";
@@ -233,11 +305,12 @@ void ShaderGen::WriteHeader(std::stringstream& ss)
     ss << "#define LOAD_TEXTURE_BUFFER(name, index) texelFetch(name, index)\n";
     ss << "#define BEGIN_ARRAY(type, size) type[size](\n";
     ss << "#define END_ARRAY )\n";
+    ss << "#define VECTOR_BROADCAST(type, value) (type(value))\n";
 
-    ss << "float saturate(float value) { return clamp(value, 0.0, 1.0); }\n";
-    ss << "float2 saturate(float2 value) { return clamp(value, float2(0.0, 0.0), float2(1.0, 1.0)); }\n";
-    ss << "float3 saturate(float3 value) { return clamp(value, float3(0.0, 0.0, 0.0), float3(1.0, 1.0, 1.0)); }\n";
-    ss << "float4 saturate(float4 value) { return clamp(value, float4(0.0, 0.0, 0.0, 0.0), float4(1.0, 1.0, 1.0, "
+    ss << "float saturate(float value) { return clamp(value, 0.0, 1.0); }\n"
+          "float2 saturate(float2 value) { return clamp(value, float2(0.0, 0.0), float2(1.0, 1.0)); }\n"
+          "float3 saturate(float3 value) { return clamp(value, float3(0.0, 0.0, 0.0), float3(1.0, 1.0, 1.0)); }\n"
+          "float4 saturate(float4 value) { return clamp(value, float4(0.0, 0.0, 0.0, 0.0), float4(1.0, 1.0, 1.0, "
           "1.0)); }\n";
   }
   else
@@ -255,6 +328,9 @@ void ShaderGen::WriteHeader(std::stringstream& ss)
     ss << "#define uivec2 uint2\n";
     ss << "#define uivec3 uint3\n";
     ss << "#define uivec4 uint4\n";
+    ss << "#define bvec2 bool2\n";
+    ss << "#define bvec3 bool3\n";
+    ss << "#define bvec4 bool4\n";
     ss << "#define mat2 float2x2\n";
     ss << "#define mat3 float3x3\n";
     ss << "#define mat4 float4x4\n";
@@ -279,6 +355,23 @@ void ShaderGen::WriteHeader(std::stringstream& ss)
     ss << "#define LOAD_TEXTURE_BUFFER(name, index) name.Load(index)\n";
     ss << "#define BEGIN_ARRAY(type, size) {\n";
     ss << "#define END_ARRAY }\n";
+    ss << "#define VECTOR_BROADCAST(type, value) ((type)(value))\n";
+  }
+
+  // Pack functions missing from GLSL ES 3.0.
+  // We can't rely on __VERSION__ because Adreno is a broken turd and reports 300 even for GLES 3.2.
+  if (!m_glsl || (m_shader_language == GPUShaderLanguage::GLSL && m_glsl_version < 400) ||
+      (m_shader_language == GPUShaderLanguage::GLSLES && m_glsl_version < 310))
+  {
+    ss << "uint packUnorm4x8(float4 value) {\n"
+          "  uint4 ret = uint4(round(saturate(value) * 255.0));\n"
+          "  return ret.x | (ret.y << 8) | (ret.z << 16) | (ret.w << 24);\n"
+          "}\n"
+          "\n"
+          "float4 unpackUnorm4x8(uint value) {\n"
+          "  uint4 ret = uint4(value & 0xffu, (value >> 8) & 0xffu, (value >> 16) & 0xffu, value >> 24);\n"
+          "  return float4(ret) / 255.0;\n"
+          "}\n";
   }
 
   ss << "\n";
@@ -286,45 +379,42 @@ void ShaderGen::WriteHeader(std::stringstream& ss)
   m_has_uniform_buffer = false;
 }
 
-void ShaderGen::WriteUniformBufferDeclaration(std::stringstream& ss, bool push_constant_on_vulkan)
+void ShaderGen::WriteUniformBufferDeclaration(std::stringstream& ss, bool push_constant) const
 {
-  if (IsVulkan())
+  const u32 binding = push_constant ? 1 : 0;
+  const char* const name = push_constant ? "PushConstants" : "UBOBlock";
+  if (m_shader_language == GPUShaderLanguage::GLSLVK)
   {
-    if (push_constant_on_vulkan)
+    if (push_constant && (m_render_api == RenderAPI::Vulkan || m_render_api == RenderAPI::Metal))
     {
-      ss << "layout(push_constant) uniform PushConstants\n";
+      ss << "layout(push_constant, row_major) uniform " << name << "\n";
     }
     else
     {
-      ss << "layout(std140, set = 0, binding = 0) uniform UBOBlock\n";
+      ss << "layout(std140, row_major, set = 0, binding = " << binding << ") uniform " << name << "\n";
       m_has_uniform_buffer = true;
     }
-  }
-  else if (IsMetal())
-  {
-    ss << "layout(std140, set = 0, binding = 0) uniform UBOBlock\n";
-    m_has_uniform_buffer = true;
   }
   else if (m_glsl)
   {
     if (m_use_glsl_binding_layout)
-      ss << "layout(std140, binding = 1) uniform UBOBlock\n";
+      ss << "layout(std140, row_major, binding = " << binding << ") uniform " << name << "\n";
     else
-      ss << "layout(std140) uniform UBOBlock\n";
+      ss << "layout(std140, row_major) uniform " << name << "\n";
 
     m_has_uniform_buffer = true;
   }
   else
   {
-    ss << "cbuffer UBOBlock : register(b0)\n";
+    ss << "cbuffer " << name << " : register(b" << binding << ")\n";
     m_has_uniform_buffer = true;
   }
 }
 
 void ShaderGen::DeclareUniformBuffer(std::stringstream& ss, const std::initializer_list<const char*>& members,
-                                     bool push_constant_on_vulkan)
+                                     bool push_constant) const
 {
-  WriteUniformBufferDeclaration(ss, push_constant_on_vulkan);
+  WriteUniformBufferDeclaration(ss, push_constant);
 
   ss << "{\n";
   for (const char* member : members)
@@ -332,30 +422,34 @@ void ShaderGen::DeclareUniformBuffer(std::stringstream& ss, const std::initializ
   ss << "};\n\n";
 }
 
-void ShaderGen::DeclareTexture(std::stringstream& ss, const char* name, u32 index, bool multisampled /* = false */)
+void ShaderGen::DeclareTexture(std::stringstream& ss, const char* name, u32 index, bool multisampled /* = false */,
+                               bool is_int /* = false */, bool is_unsigned /* = false */) const
 {
   if (m_glsl)
   {
-    if (IsVulkan())
-      ss << "layout(set = " << (m_has_uniform_buffer ? 1 : 0) << ", binding = " << index << ") ";
+    if (m_spirv)
+      ss << "layout(set = " << ((m_has_uniform_buffer || IsMetal()) ? 1 : 0) << ", binding = " << index << ") ";
     else if (m_use_glsl_binding_layout)
       ss << "layout(binding = " << index << ") ";
 
-    ss << "uniform " << (multisampled ? "sampler2DMS " : "sampler2D ") << name << ";\n";
+    ss << "uniform " << (is_int ? (is_unsigned ? "u" : "i") : "") << (multisampled ? "sampler2DMS " : "sampler2D ")
+       << name << ";\n";
   }
   else
   {
-    ss << (multisampled ? "Texture2DMS<float4> " : "Texture2D ") << name << " : register(t" << index << ");\n";
+    ss << (multisampled ? "Texture2DMS<" : "Texture2D<") << (is_int ? (is_unsigned ? "uint4" : "int4") : "float4")
+       << "> " << name << " : register(t" << index << ");\n";
     ss << "SamplerState " << name << "_ss : register(s" << index << ");\n";
   }
 }
 
-void ShaderGen::DeclareTextureBuffer(std::stringstream& ss, const char* name, u32 index, bool is_int, bool is_unsigned)
+void ShaderGen::DeclareTextureBuffer(std::stringstream& ss, const char* name, u32 index, bool is_int,
+                                     bool is_unsigned) const
 {
   if (m_glsl)
   {
-    if (IsVulkan())
-      ss << "layout(set = 0, binding = " << index << ") ";
+    if (m_spirv)
+      ss << "layout(set = " << ((m_has_uniform_buffer || IsMetal()) ? 1 : 0) << ", binding = " << index << ") ";
     else if (m_use_glsl_binding_layout)
       ss << "layout(binding = " << index << ") ";
 
@@ -365,6 +459,27 @@ void ShaderGen::DeclareTextureBuffer(std::stringstream& ss, const char* name, u3
   {
     ss << "Buffer<" << (is_int ? (is_unsigned ? "uint4" : "int4") : "float4") << "> " << name << " : register(t"
        << index << ");\n";
+  }
+}
+
+void ShaderGen::DeclareImage(std::stringstream& ss, const char* name, u32 index, bool is_float /* = false */,
+                             bool is_int /* = false */, bool is_unsigned /* = false */) const
+{
+  if (m_glsl)
+  {
+    if (m_spirv)
+      ss << "layout(set = " << (m_has_uniform_buffer ? 2 : 1) << ", binding = " << index;
+    else
+      ss << "layout(binding = " << index;
+
+    ss << ", " << (is_int ? (is_unsigned ? "rgba8ui" : "rgba8i") : "rgba8") << ") "
+       << "uniform restrict coherent image2D " << name << ";\n";
+  }
+  else
+  {
+    ss << "RasterizerOrderedTexture2D<"
+       << (is_int ? (is_unsigned ? "uint4" : "int4") : (is_float ? "float4" : "unorm float4")) << "> " << name
+       << " : register(u" << index << ");\n";
   }
 }
 
@@ -391,7 +506,7 @@ void ShaderGen::DeclareVertexEntryPoint(
   std::stringstream& ss, const std::initializer_list<const char*>& attributes, u32 num_color_outputs,
   u32 num_texcoord_outputs, const std::initializer_list<std::pair<const char*, const char*>>& additional_outputs,
   bool declare_vertex_id /* = false */, const char* output_block_suffix /* = "" */, bool msaa /* = false */,
-  bool ssaa /* = false */, bool noperspective_color /* = false */)
+  bool ssaa /* = false */, bool noperspective_color /* = false */) const
 {
   if (m_glsl)
   {
@@ -435,14 +550,28 @@ void ShaderGen::DeclareVertexEntryPoint(
     {
       const char* qualifier = GetInterpolationQualifier(false, msaa, ssaa, true);
 
+      u32 location = 0;
       for (u32 i = 0; i < num_color_outputs; i++)
+      {
+        if (m_spirv)
+          ss << "layout(location = " << location++ << ") ";
+
         ss << qualifier << (noperspective_color ? "noperspective " : "") << "out float4 v_col" << i << ";\n";
+      }
 
       for (u32 i = 0; i < num_texcoord_outputs; i++)
+      {
+        if (m_spirv)
+          ss << "layout(location = " << location++ << ") ";
+
         ss << qualifier << "out float2 v_tex" << i << ";\n";
+      }
 
       for (const auto& [qualifiers, name] : additional_outputs)
       {
+        if (m_spirv)
+          ss << "layout(location = " << location++ << ") ";
+
         const char* qualifier_to_use = (std::strlen(qualifiers) > 0) ? qualifiers : qualifier;
         ss << qualifier_to_use << " out " << name << ";\n";
       }
@@ -497,10 +626,11 @@ void ShaderGen::DeclareVertexEntryPoint(
 
 void ShaderGen::DeclareFragmentEntryPoint(
   std::stringstream& ss, u32 num_color_inputs, u32 num_texcoord_inputs,
-  const std::initializer_list<std::pair<const char*, const char*>>& additional_inputs,
-  bool declare_fragcoord /* = false */, u32 num_color_outputs /* = 1 */, bool depth_output /* = false */,
-  bool msaa /* = false */, bool ssaa /* = false */, bool declare_sample_id /* = false */,
-  bool noperspective_color /* = false */, bool framebuffer_fetch /* = false */)
+  const std::initializer_list<std::pair<const char*, const char*>>& additional_inputs /* =  */,
+  bool declare_fragcoord /* = false */, u32 num_color_outputs /* = 1 */, bool dual_source_output /* = false */,
+  bool depth_output /* = false */, bool msaa /* = false */, bool ssaa /* = false */,
+  bool declare_sample_id /* = false */, bool noperspective_color /* = false */, bool feedback_loop /* = false */,
+  bool rov /* = false */) const
 {
   if (m_glsl)
   {
@@ -531,14 +661,28 @@ void ShaderGen::DeclareFragmentEntryPoint(
       {
         const char* qualifier = GetInterpolationQualifier(false, msaa, ssaa, false);
 
+        u32 location = 0;
         for (u32 i = 0; i < num_color_inputs; i++)
+        {
+          if (m_spirv)
+            ss << "layout(location = " << location++ << ") ";
+
           ss << qualifier << (noperspective_color ? "noperspective " : "") << "in float4 v_col" << i << ";\n";
+        }
 
         for (u32 i = 0; i < num_texcoord_inputs; i++)
+        {
+          if (m_spirv)
+            ss << "layout(location = " << location++ << ") ";
+
           ss << qualifier << "in float2 v_tex" << i << ";\n";
+        }
 
         for (const auto& [qualifiers, name] : additional_inputs)
         {
+          if (m_spirv)
+            ss << "layout(location = " << location++ << ") ";
+
           const char* qualifier_to_use = (std::strlen(qualifiers) > 0) ? qualifiers : qualifier;
           ss << qualifier_to_use << " in " << name << ";\n";
         }
@@ -555,25 +699,67 @@ void ShaderGen::DeclareFragmentEntryPoint(
       ss << "#define o_depth gl_FragDepth\n";
 
     const char* target_0_qualifier = "out";
-#ifdef ENABLE_OPENGL
-    if ((m_render_api == RenderAPI::OpenGL || m_render_api == RenderAPI::OpenGLES) && m_supports_framebuffer_fetch &&
-        framebuffer_fetch)
+
+    if (feedback_loop)
     {
-      if (GLAD_GL_EXT_shader_framebuffer_fetch)
+      Assert(!rov);
+
+#ifdef ENABLE_OPENGL
+      if (m_render_api == RenderAPI::OpenGL || m_render_api == RenderAPI::OpenGLES)
       {
-        target_0_qualifier = "inout";
-        ss << "#define LAST_FRAG_COLOR o_col0\n";
+        Assert(m_supports_framebuffer_fetch);
+        if (GLAD_GL_EXT_shader_framebuffer_fetch)
+        {
+          target_0_qualifier = "inout";
+          ss << "#define LAST_FRAG_COLOR o_col0\n";
+        }
+        else if (GLAD_GL_ARM_shader_framebuffer_fetch)
+        {
+          ss << "#define LAST_FRAG_COLOR gl_LastFragColorARM\n";
+        }
       }
-      else if (GLAD_GL_ARM_shader_framebuffer_fetch)
-      {
-        ss << "#define LAST_FRAG_COLOR gl_LastFragColorARM\n";
-      }
-    }
 #endif
+#ifdef ENABLE_VULKAN
+      if (m_render_api == RenderAPI::Vulkan)
+      {
+        ss << "layout(input_attachment_index = 0, set = 2, binding = 0) uniform "
+           << (msaa ? "subpassInputMS" : "subpassInput") << " u_input_rt; \n";
+        ss << "#define LAST_FRAG_COLOR " << (msaa ? "subpassLoad(u_input_rt, gl_SampleID)" : "subpassLoad(u_input_rt)")
+           << "\n";
+      }
+#endif
+#ifdef __APPLE__
+      if (m_render_api == RenderAPI::Metal)
+      {
+        if (m_supports_framebuffer_fetch)
+        {
+          // Set doesn't matter, because it's transformed to color0.
+          ss << "layout(input_attachment_index = 0, set = 2, binding = 0) uniform "
+             << (msaa ? "subpassInputMS" : "subpassInput") << " u_input_rt; \n";
+          ss << "#define LAST_FRAG_COLOR "
+             << (msaa ? "subpassLoad(u_input_rt, gl_SampleID)" : "subpassLoad(u_input_rt)") << "\n";
+        }
+        else
+        {
+          ss << "layout(set = 2, binding = 0) uniform " << (msaa ? "texture2DMS" : "texture2D") << " u_input_rt;\n";
+          ss << "#define LAST_FRAG_COLOR texelFetch(u_input_rt, int2(gl_FragCoord.xy), " << (msaa ? "gl_SampleID" : "0")
+             << ")\n";
+        }
+      }
+#endif
+    }
+    else if (rov)
+    {
+      ss << "layout(pixel_interlock_ordered) in;\n";
+      ss << "#define ROV_LOAD(name, coords) imageLoad(name, ivec2(coords))\n";
+      ss << "#define ROV_STORE(name, coords, value) imageStore(name, ivec2(coords), value)\n";
+      ss << "#define BEGIN_ROV_REGION beginInvocationInterlockARB()\n";
+      ss << "#define END_ROV_REGION endInvocationInterlockARB()\n";
+    }
 
     if (m_use_glsl_binding_layout)
     {
-      if (m_supports_dual_source_blend)
+      if (dual_source_output && m_supports_dual_source_blend && num_color_outputs > 1)
       {
         for (u32 i = 0; i < num_color_outputs; i++)
         {
@@ -583,8 +769,11 @@ void ShaderGen::DeclareFragmentEntryPoint(
       }
       else
       {
-        Assert(num_color_outputs <= 1);
-        ss << "layout(location = 0) " << target_0_qualifier << " float4 o_col0;\n";
+        for (u32 i = 0; i < num_color_outputs; i++)
+        {
+          ss << "layout(location = " << i << ") " << ((i == 0) ? target_0_qualifier : "out") << " float4 o_col" << i
+             << ";\n";
+        }
       }
     }
     else
@@ -599,129 +788,169 @@ void ShaderGen::DeclareFragmentEntryPoint(
   }
   else
   {
+    if (rov)
+    {
+      ss << "#define ROV_LOAD(name, coords) name[uint2(coords)]\n";
+      ss << "#define ROV_STORE(name, coords, value) name[uint2(coords)] = value\n";
+      ss << "#define BEGIN_ROV_REGION\n";
+      ss << "#define END_ROV_REGION\n";
+    }
+
     const char* qualifier = GetInterpolationQualifier(false, msaa, ssaa, false);
 
     ss << "void main(\n";
 
+    bool first = true;
     for (u32 i = 0; i < num_color_inputs; i++)
-      ss << "  " << qualifier << (noperspective_color ? "noperspective " : "") << "in float4 v_col" << i << " : COLOR"
-         << i << ",\n";
+    {
+      ss << (first ? "" : ",\n") << "  " << qualifier << (noperspective_color ? "noperspective " : "")
+         << "in float4 v_col" << i << " : COLOR" << i;
+      first = false;
+    }
 
     for (u32 i = 0; i < num_texcoord_inputs; i++)
-      ss << "  " << qualifier << "in float2 v_tex" << i << " : TEXCOORD" << i << ",\n";
+    {
+      ss << (first ? "" : ",\n") << "  " << qualifier << "in float2 v_tex" << i << " : TEXCOORD" << i;
+      first = false;
+    }
 
     u32 additional_counter = num_texcoord_inputs;
     for (const auto& [qualifiers, name] : additional_inputs)
     {
       const char* qualifier_to_use = (std::strlen(qualifiers) > 0) ? qualifiers : qualifier;
-      ss << "  " << qualifier_to_use << " in " << name << " : TEXCOORD" << additional_counter << ",\n";
+      ss << (first ? "" : ",\n") << "  " << qualifier_to_use << " in " << name << " : TEXCOORD" << additional_counter;
       additional_counter++;
+      first = false;
     }
 
     if (declare_fragcoord)
-      ss << "  in float4 v_pos : SV_Position,\n";
+    {
+      ss << (first ? "" : ",\n") << "  in float4 v_pos : SV_Position";
+      first = false;
+    }
     if (declare_sample_id)
-      ss << "  in uint f_sample_index : SV_SampleIndex,\n";
+    {
+      ss << (first ? "" : ",\n") << "  in uint f_sample_index : SV_SampleIndex";
+      first = false;
+    }
 
     if (depth_output)
     {
-      ss << "  out float o_depth : SV_Depth";
-      if (num_color_outputs > 0)
-        ss << ",\n";
-      else
-        ss << ")\n";
+      ss << (first ? "" : ",\n") << "  out float o_depth : SV_Depth";
+      first = false;
     }
-
     for (u32 i = 0; i < num_color_outputs; i++)
     {
-      ss << "  out float4 o_col" << i << " : SV_Target" << i;
-
-      if (i == (num_color_outputs - 1))
-        ss << ")\n";
-      else
-        ss << ",\n";
+      ss << (first ? "" : ",\n") << "  out float4 o_col" << i << " : SV_Target" << i;
+      first = false;
     }
+
+    ss << ")";
   }
 }
 
-std::string ShaderGen::GenerateScreenQuadVertexShader()
+std::string ShaderGen::GeneratePassthroughVertexShader() const
 {
   std::stringstream ss;
   WriteHeader(ss);
-  DeclareVertexEntryPoint(ss, {}, 0, 1, {}, true);
+  DeclareVertexEntryPoint(ss, {"float2 a_pos", "float2 a_tex0"}, 0, 1, {}, false, "", false, false, false);
   ss << R"(
 {
-  v_tex0 = float2(float((v_id << 1) & 2u), float(v_id & 2u));
-  v_pos = float4(v_tex0 * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
-  #if API_OPENGL || API_OPENGL_ES || API_VULKAN
+  v_pos = float4(a_pos, 0.0f, 1.0f);
+  v_tex0 = a_tex0;
+
+  // NDC space Y flip in Vulkan.
+  #if API_VULKAN
     v_pos.y = -v_pos.y;
   #endif
 }
 )";
 
-  return ss.str();
+  return std::move(ss).str();
 }
 
-std::string ShaderGen::GenerateUVQuadVertexShader()
+std::string ShaderGen::GenerateScreenQuadVertexShader(float z /* = 0.0f */) const
 {
   std::stringstream ss;
   WriteHeader(ss);
-  DeclareUniformBuffer(ss, {"float2 u_uv_min", "float2 u_uv_max"}, true);
   DeclareVertexEntryPoint(ss, {}, 0, 1, {}, true);
-  ss << R"(
-{
-  v_tex0 = float2(float((v_id << 1) & 2u), float(v_id & 2u));
-  v_pos = float4(v_tex0 * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
-  v_tex0 = u_uv_min + (u_uv_max - u_uv_min) * v_tex0;
-  #if API_OPENGL || API_OPENGL_ES || API_VULKAN
-    v_pos.y = -v_pos.y;
-  #endif
-}
-)";
+  ss << "{\n";
+  ss << "  v_tex0 = float2(float((v_id << 1) & 2u), float(v_id & 2u));\n";
+  ss << "  v_pos = float4(v_tex0 * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), " << std::fixed << z << "f, 1.0f);\n";
+  ss << "  #if API_OPENGL || API_OPENGL_ES || API_VULKAN\n";
+  ss << "    v_pos.y = -v_pos.y;\n";
+  ss << "  #endif\n";
+  ss << "}\n";
 
-  return ss.str();
+  return std::move(ss).str();
 }
 
-std::string ShaderGen::GenerateFillFragmentShader()
+std::string ShaderGen::GenerateFillFragmentShader() const
 {
   std::stringstream ss;
   WriteHeader(ss);
   DeclareUniformBuffer(ss, {"float4 u_fill_color"}, true);
-  DeclareFragmentEntryPoint(ss, 0, 1, {}, false, 1, true);
+  DeclareFragmentEntryPoint(ss, 0, 1);
 
   ss << R"(
 {
   o_col0 = u_fill_color;
-  o_depth = u_fill_color.a;
 }
 )";
 
-  return ss.str();
+  return std::move(ss).str();
 }
 
-std::string ShaderGen::GenerateCopyFragmentShader()
+std::string ShaderGen::GenerateFillFragmentShader(const GSVector4 fixed_color) const
 {
   std::stringstream ss;
   WriteHeader(ss);
-  DeclareUniformBuffer(ss, {"float4 u_src_rect"}, true);
-  DeclareTexture(ss, "samp0", 0);
-  DeclareFragmentEntryPoint(ss, 0, 1, {}, false, 1);
+  DeclareFragmentEntryPoint(ss, 0, 0);
 
-  ss << R"(
+  ss << "{\n";
+  ss << "  o_col0 = float4(" << std::fixed << fixed_color.x << ", " << fixed_color.y << ", " << fixed_color.z << ", "
+     << fixed_color.w << ");\n";
+  ss << "}\n";
+
+  return std::move(ss).str();
+}
+
+std::string ShaderGen::GenerateCopyFragmentShader(bool offset) const
+{
+  std::stringstream ss;
+  WriteHeader(ss);
+  if (offset)
+    DeclareUniformBuffer(ss, {"float4 u_src_rect"}, true);
+
+  DeclareTexture(ss, "samp0", 0);
+  DeclareFragmentEntryPoint(ss, 0, 1);
+
+  if (offset)
+  {
+    ss << R"(
 {
   float2 coords = u_src_rect.xy + v_tex0 * u_src_rect.zw;
   o_col0 = SAMPLE_TEXTURE(samp0, coords);
 }
 )";
+  }
+  else
+  {
+    ss << R"(
+{
+  o_col0 = SAMPLE_TEXTURE(samp0, v_tex0);
+}
+)";
+  }
 
-  return ss.str();
+  return std::move(ss).str();
 }
 
-std::string ShaderGen::GenerateImGuiVertexShader()
+std::string ShaderGen::GenerateImGuiVertexShader() const
 {
   std::stringstream ss;
   WriteHeader(ss);
-  DeclareUniformBuffer(ss, {"float4x4 ProjectionMatrix"}, true);
+  DeclareUniformBuffer(ss, {"float4x4 ProjectionMatrix"}, false);
   DeclareVertexEntryPoint(ss, {"float2 a_pos", "float2 a_tex0", "float4 a_col0"}, 1, 1, {}, false);
   ss << R"(
 {
@@ -734,21 +963,183 @@ std::string ShaderGen::GenerateImGuiVertexShader()
 }
 )";
 
-  return ss.str();
+  return std::move(ss).str();
 }
 
-std::string ShaderGen::GenerateImGuiFragmentShader()
+std::string ShaderGen::GenerateImGuiFragmentShader() const
 {
   std::stringstream ss;
   WriteHeader(ss);
+  DeclareUniformBuffer(ss, {"float4x4 ProjectionMatrix"}, false); // needs the descriptor set defined
   DeclareTexture(ss, "samp0", 0);
-  DeclareFragmentEntryPoint(ss, 1, 1, {}, false, 1);
+  DeclareFragmentEntryPoint(ss, 1, 1);
 
   ss << R"(
 {
   o_col0 = v_col0 * SAMPLE_TEXTURE(samp0, v_tex0);
 }
+  )";
+
+  return std::move(ss).str();
+}
+
+std::string ShaderGen::GenerateImGuiBlurVertexShader() const
+{
+  std::stringstream ss;
+  WriteHeader(ss);
+  DeclareUniformBuffer(ss, {"float4x4 ProjectionMatrix"}, false);
+  DeclareUniformBuffer(ss, {"float2 BlurTextureScale", "float BlurBackgroundWeight", "float InvBlurBackgroundWeight"},
+                       true);
+  DeclareVertexEntryPoint(ss, {"float2 a_pos", "float4 a_col0"}, 1, 0, {}, false);
+  ss << R"(
+{
+  v_pos = mul(ProjectionMatrix, float4(a_pos, 0.f, 1.f));
+  v_col0 = a_col0;
+  #if API_VULKAN
+    v_pos.y = -v_pos.y;
+  #endif
+}
 )";
 
-  return ss.str();
+  return std::move(ss).str();
+}
+
+std::string ShaderGen::GenerateImGuiBlurFragmentShader() const
+{
+  std::stringstream ss;
+  WriteHeader(ss);
+  DeclareUniformBuffer(ss, {"float4x4 ProjectionMatrix"}, false); // needs the descriptor set defined
+  DeclareUniformBuffer(ss, {"float2 BlurTextureScale", "float BlurBackgroundWeight", "float InvBlurBackgroundWeight"},
+                       true);
+  DeclareTexture(ss, "samp0", 0);
+  DeclareFragmentEntryPoint(ss, 1, 0, {}, true);
+
+  ss << R"(
+{
+  int2 blur_pos = int2(floor(v_pos.xy) * BlurTextureScale);
+  o_col0 = float4(LOAD_TEXTURE(samp0, blur_pos, 0).rgb * BlurBackgroundWeight + v_col0.rgb * InvBlurBackgroundWeight, v_col0.a);
+}
+)";
+
+  return std::move(ss).str();
+}
+
+std::string ShaderGen::GenerateFadeFragmentShader() const
+{
+  std::stringstream ss;
+  WriteHeader(ss);
+  DeclareUniformBuffer(ss, {"float u_tex0_weight", "float u_tex1_weight"}, true);
+  DeclareTexture(ss, "samp0", 0);
+  DeclareTexture(ss, "samp1", 1);
+  DeclareFragmentEntryPoint(ss, 0, 1);
+
+  ss << R"(
+{
+  o_col0 = SAMPLE_TEXTURE(samp0, v_tex0) * u_tex0_weight;
+  o_col0 += SAMPLE_TEXTURE(samp1, v_tex0) * u_tex1_weight;
+  o_col0.a = 1.0f;
+}
+)";
+
+  return std::move(ss).str();
+}
+
+std::string ShaderGen::GenerateGaussianBlurFragmentShader() const
+{
+  std::stringstream ss;
+  WriteHeader(ss);
+
+  // Push constants: blur direction scaled by texel size (x_dir/width, y_dir/height)
+  DeclareUniformBuffer(ss, {"float2 u_blur_direction"}, true);
+  DeclareTexture(ss, "samp0", 0);
+
+  // https://lisyarus.github.io/blog/posts/blur-coefficients-generator.html
+  // Radius: 30, sigma: 20
+  ss << R"(
+#define SAMPLE_COUNT 31
+
+CONSTANT float OFFSETS[SAMPLE_COUNT] = BEGIN_ARRAY(float, SAMPLE_COUNT)
+-29.481574788498758,
+-27.482822966811984,
+-25.48407133476425,
+-23.48531987689748,
+-21.4865685814993,
+-19.487817441187733,
+-17.4890664530808,
+-15.49031561813869,
+-13.491564939014534,
+-11.492814415362423,
+-9.49406403495946,
+-7.495313758095638,
+-5.496563491310285,
+-3.4978130444607514,
+-1.4990620619239194,
+0.4996866407382734,
+2.498437651462263,
+4.497188307705211,
+6.4959386324091755,
+8.494688887763292,
+10.493439208848661,
+12.492189658097768,
+14.490940258972138,
+16.48969101629867,
+18.48844192812288,
+20.487192992240907,
+22.485944209457497,
+24.484695584886197,
+26.48344712812872,
+28.482198852858183,
+30.0
+END_ARRAY;
+
+CONSTANT float WEIGHTS[SAMPLE_COUNT] = BEGIN_ARRAY(float, SAMPLE_COUNT)
+0.01541016258836947,
+0.017768151535171497,
+0.020283267106540014,
+0.022924205290094233,
+0.025651423266747478,
+0.02841773778937317,
+0.03116939833169751,
+0.03384762398431486,
+0.03639055836034262,
+0.03873556231203028,
+0.040821733313367456,
+0.042592516137640944,
+0.043998254731464806,
+0.0449985319608136,
+0.04556415312900511,
+0.04567825324468065,
+0.04533701597951506,
+0.04455118394212641,
+0.043343783883772295,
+0.04174984227341022,
+0.03981466909233367,
+0.03759167925377385,
+0.03513992790902628,
+0.032521509921346885,
+0.029798976743363043,
+0.027032914767164073,
+0.024279809433072556,
+0.02159029141425853,
+0.019007828077837678,
+0.016567888438120362,
+0.007421145789225499
+END_ARRAY;
+)";
+
+  DeclareFragmentEntryPoint(ss, 0, 1);
+  ss << R"(
+{
+  float3 result = float3(0.0f, 0.0f, 0.0f);
+  for (int i = 0; i < SAMPLE_COUNT; i++)
+  {
+    float2 offset = u_blur_direction * OFFSETS[i];
+    float3 color = SAMPLE_TEXTURE(samp0, v_tex0 + offset).rgb;
+    result += color * WEIGHTS[i];
+  }
+
+  o_col0 = float4(result, 1.0);
+})";
+
+  return std::move(ss).str();
 }

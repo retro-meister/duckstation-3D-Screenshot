@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2019-2022 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 
@@ -17,14 +17,14 @@ public:
   explicit ConsoleSettingsWidget(SettingsWindow* dialog, QWidget* parent);
   ~ConsoleSettingsWidget();
 
-private Q_SLOTS:
+private:
+  void calculateCPUClockValue();
+
+  void onFastBootChanged();
   void updateRecompilerICacheEnabled();
   void onEnableCPUClockSpeedControlChecked(int state);
   void onCPUClockSpeedValueChanged(int value);
   void updateCPUClockSpeedLabel();
-
-private:
-  void calculateCPUClockValue();
 
   Ui::ConsoleSettingsWidget m_ui;
 

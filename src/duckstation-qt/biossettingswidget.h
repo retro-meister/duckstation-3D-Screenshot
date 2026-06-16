@@ -1,5 +1,5 @@
-// SPDX-FileCopyrightText: 2019-2022 Connor McLaughlin <stenzek@gmail.com>
-// SPDX-License-Identifier: (GPL-3.0 OR CC-BY-NC-ND-4.0)
+// SPDX-FileCopyrightText: 2019-2024 Connor McLaughlin <stenzek@gmail.com>
+// SPDX-License-Identifier: CC-BY-NC-ND-4.0
 
 #pragma once
 #include "core/types.h"
@@ -9,7 +9,7 @@
 
 class SettingsWindow;
 
-enum class ConsoleRegion;
+enum class ConsoleRegion : u8;
 namespace BIOS {
 struct ImageInfo;
 }
@@ -26,12 +26,12 @@ public:
                                         std::vector<std::pair<std::string, const BIOS::ImageInfo*>>& images,
                                         bool per_game);
   static void setDropDownValue(QComboBox* cb, const std::optional<std::string>& name, bool per_game);
-  static std::vector<std::pair<std::string, const BIOS::ImageInfo*>> getList(const char* directory);
-
-private Q_SLOTS:
-  void refreshList();
 
 private:
+  void refreshList();
+  void onPIODeviceTypeChanged();
+  void onPIOImagePathBrowseClicked();
+
   Ui::BIOSSettingsWidget m_ui;
 
   SettingsWindow* m_dialog;
